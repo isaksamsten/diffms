@@ -59,6 +59,10 @@ class SpectraEncoder(nn.Module):
         output = self.spectra_encoder[2](encoder_output)
         aux_outputs["h0"] = encoder_output
 
+        # Forward peak-level representations for cross-attention
+        aux_outputs["peak_tensor"] = aux_out["peak_tensor"]   # (B, Np, hidden_size)
+        aux_outputs["peak_mask"] = aux_out["peak_mask"]        # (B, Np)
+
         return output, aux_outputs
     
     
@@ -115,8 +119,12 @@ class SpectraEncoderGrowing(nn.Module):
         aux_outputs["int_preds"] = intermediates
         output = final_output
         aux_outputs["h0"] = encoder_output
+
+        # Forward peak-level representations for cross-attention
+        aux_outputs["peak_tensor"] = aux_out["peak_tensor"]   # (B, Np, hidden_size)
+        aux_outputs["peak_mask"] = aux_out["peak_mask"]        # (B, Np)
         
-        return output, aux_outputs # aux_outputs["int_preds"][-1]
+        return output, aux_outputs
 
     
 

@@ -77,13 +77,24 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         self.extra_features = extra_features
         self.domain_features = domain_features
 
+        # --- Cross-attention feature flag ---
+        self.use_cross_attention = getattr(cfg.model, 'cross_attention', False)
+
+        hidden_size = 256
+        try:
+            hidden_size = cfg.model.encoder_hidden_dim
+        except:
+            print("No hidden size specified, using default value of 256")
+
         self.decoder = GraphTransformer(n_layers=cfg.model.n_layers,
                                       input_dims=input_dims,
                                       hidden_mlp_dims=cfg.model.hidden_mlp_dims,
                                       hidden_dims=cfg.model.hidden_dims,
                                       output_dims=output_dims,
                                       act_fn_in=nn.ReLU(),
-                                      act_fn_out=nn.ReLU())
+                                      act_fn_out=nn.ReLU(),
+                                      cross_attention=self.use_cross_attention,
+                                      d_peak=hidden_size)
 
         try:
             if cfg.general.decoder is not None:
@@ -97,15 +108,9 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                         k = k[6:]
                         cleaned_state_dict[k] = v
 
-                self.decoder.load_state_dict(cleaned_state_dict)
+                self.decoder.load_state_dict(cleaned_state_dict, strict=not self.use_cross_attention)
         except Exception as e:
             logging.info(f"Could not load decoder: {e}")
-
-        hidden_size = 256
-        try:
-            hidden_size = cfg.model.encoder_hidden_dim
-        except:
-            print("No hidden size specified, using default value of 256")
 
         magma_modulo = 512
         try:
@@ -187,23 +192,16 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         output, aux = self.encoder(batch)
 
         data = batch["graph"]
-        if self.merge == 'mist_fp':
-            data.y = aux["int_preds"][-1]
-        if self.merge == 'merge-encoder_output-linear':
-            encoder_output = aux['h0']
-            data.y = self.merge_function(encoder_output)
-        elif self.merge == 'merge-encoder_output-mlp':
-            encoder_output = aux['h0']
-            data.y = self.merge_function(encoder_output)
-        elif self.merge == 'downproject_4096':
-            data.y = self.merge_function(output)
+        data = self._apply_merge(data, output, aux)
 
         dense_data, node_mask = utils.to_dense(data.x, data.edge_index, data.edge_attr, data.batch)
         dense_data = dense_data.mask(node_mask)
         X, E = dense_data.X, dense_data.E
         noisy_data = self.apply_noise(X, E, data.y, node_mask)
         extra_data = self.compute_extra_data(noisy_data)
-        pred = self.forward(noisy_data, extra_data, node_mask)
+        peak_tokens, peak_mask = self._get_peak_context()
+        pred = self.forward(noisy_data, extra_data, node_mask,
+                            peak_tokens=peak_tokens, peak_mask=peak_mask)
 
         loss = self.train_loss(masked_pred_X=pred.X, masked_pred_E=pred.E, pred_y=pred.y,
                                true_X=X, true_E=E, true_y=data.y,
@@ -274,16 +272,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         output, aux = self.encoder(batch)
 
         data = batch["graph"]
-        if self.merge == 'mist_fp':
-            data.y = aux["int_preds"][-1]
-        if self.merge == 'merge-encoder_output-linear':
-            encoder_output = aux['h0']
-            data.y = self.merge_function(encoder_output)
-        elif self.merge == 'merge-encoder_output-mlp':
-            encoder_output = aux['h0']
-            data.y = self.merge_function(encoder_output)
-        elif self.merge == 'downproject_4096':
-            data.y = self.merge_function(output)
+        data = self._apply_merge(data, output, aux)
 
 
         dense_data, node_mask = utils.to_dense(data.x, data.edge_index, data.edge_attr, data.batch)
@@ -291,7 +280,9 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         noisy_data = self.apply_noise(dense_data.X, dense_data.E, data.y, node_mask)
         extra_data = self.compute_extra_data(noisy_data)
 
-        pred = self.forward(noisy_data, extra_data, node_mask)
+        peak_tokens, peak_mask = self._get_peak_context()
+        pred = self.forward(noisy_data, extra_data, node_mask,
+                            peak_tokens=peak_tokens, peak_mask=peak_mask)
         pred.X = dense_data.X
         pred.Y = data.y
 
@@ -374,23 +365,16 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         output, aux = self.encoder(batch)
 
         data = batch["graph"]
-        if self.merge == 'mist_fp':
-            data.y = aux["int_preds"][-1]
-        if self.merge == 'merge-encoder_output-linear':
-            encoder_output = aux['h0']
-            data.y = self.merge_function(encoder_output)
-        elif self.merge == 'merge-encoder_output-mlp':
-            encoder_output = aux['h0']
-            data.y = self.merge_function(encoder_output)
-        elif self.merge == 'downproject_4096':
-            data.y = self.merge_function(output)
+        data = self._apply_merge(data, output, aux)
 
         dense_data, node_mask = utils.to_dense(data.x, data.edge_index, data.edge_attr, data.batch)
         dense_data = dense_data.mask(node_mask)
         noisy_data = self.apply_noise(dense_data.X, dense_data.E, data.y, node_mask)
         extra_data = self.compute_extra_data(noisy_data)
 
-        pred = self.forward(noisy_data, extra_data, node_mask)
+        peak_tokens, peak_mask = self._get_peak_context()
+        pred = self.forward(noisy_data, extra_data, node_mask,
+                            peak_tokens=peak_tokens, peak_mask=peak_mask)
         pred.X = dense_data.X
         pred.Y = data.y
 
@@ -544,7 +528,9 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         noisy_data = {'X_t': sampled_0.X, 'E_t': sampled_0.E, 'y_t': sampled_0.y, 'node_mask': node_mask,
                       't': torch.zeros(X0.shape[0], 1).type_as(y0)}
         extra_data = self.compute_extra_data(noisy_data)
-        pred0 = self.forward(noisy_data, extra_data, node_mask)
+        peak_tokens, peak_mask = self._get_peak_context()
+        pred0 = self.forward(noisy_data, extra_data, node_mask,
+                             peak_tokens=peak_tokens, peak_mask=peak_mask)
 
         # Normalize predictions
         probX0 = F.softmax(pred0.X, dim=-1)
@@ -637,11 +623,42 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
 
         return nll
 
-    def forward(self, noisy_data, extra_data, node_mask):
+    def _apply_merge(self, data, output, aux):
+        """Apply the merge strategy to set data.y from encoder outputs.
+
+        Also stores peak tokens and mask for cross-attention when enabled.
+        """
+        if self.merge == 'mist_fp':
+            data.y = aux["int_preds"][-1]
+        if self.merge == 'merge-encoder_output-linear':
+            encoder_output = aux['h0']
+            data.y = self.merge_function(encoder_output)
+        elif self.merge == 'merge-encoder_output-mlp':
+            encoder_output = aux['h0']
+            data.y = self.merge_function(encoder_output)
+        elif self.merge == 'downproject_4096':
+            data.y = self.merge_function(output)
+
+        # Store peak tokens for cross-attention (always extracted; only used
+        # downstream when self.use_cross_attention is True).
+        self._peak_tokens = aux.get("peak_tensor", None)   # (B, Np, hidden_size)
+        self._peak_mask = aux.get("peak_mask", None)        # (B, Np), True=valid
+
+        return data
+
+    def _get_peak_context(self):
+        """Return (peak_tokens, peak_mask) for cross-attention, or (None, None)."""
+        if self.use_cross_attention:
+            return self._peak_tokens, self._peak_mask
+        return None, None
+
+    def forward(self, noisy_data, extra_data, node_mask,
+                peak_tokens=None, peak_mask=None):
         X = torch.cat((noisy_data['X_t'], extra_data.X), dim=2).float()
         E = torch.cat((noisy_data['E_t'], extra_data.E), dim=3).float()
         y = torch.hstack((noisy_data['y_t'], extra_data.y)).float()
-        return self.decoder(X, E, y, node_mask)
+        return self.decoder(X, E, y, node_mask,
+                            peak_tokens=peak_tokens, peak_mask=peak_mask)
     
     @torch.no_grad()
     def sample_batch(self, data: Batch) -> Batch:
@@ -690,7 +707,9 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         # Neural net predictions
         noisy_data = {'X_t': X_t, 'E_t': E_t, 'y_t': y_t, 't': t, 'node_mask': node_mask}
         extra_data = self.compute_extra_data(noisy_data)
-        pred = self.forward(noisy_data, extra_data, node_mask)
+        peak_tokens, peak_mask = self._get_peak_context()
+        pred = self.forward(noisy_data, extra_data, node_mask,
+                            peak_tokens=peak_tokens, peak_mask=peak_mask)
 
         # Normalize predictions
         pred_X = F.softmax(pred.X, dim=-1)               # bs, n, d0

@@ -248,6 +248,8 @@ class FormulaTransformer(nn.Module):
             peak_tensor, inten_tensor, peak_types, attn_mask, batch_dim
         )
         aux_output["peak_tensor"] = peak_tensor.transpose(0, 1)
+        # peak_mask: True for valid (non-padded) peaks, shape (B, Np)
+        aux_output["peak_mask"] = ~attn_mask
 
         # Now convert into output dim
         if return_aux:

@@ -29,7 +29,7 @@ def to_list(value: Any) -> Sequence:
 def process_single_inchi(args):
     """
     Process a single inchi string.
-    
+
     Parameters:
         args: tuple of (i, inchi, types, bonds, morgan_r, morgan_nbits,
                            filter_dataset, pre_filter, pre_transform, atom_decoder)
@@ -43,7 +43,7 @@ def process_single_inchi(args):
     #unpack args
     (i, inchi, types, bonds, morgan_r, morgan_nbits,
      filter_dataset, pre_filter, pre_transform, atom_decoder) = args
-    
+
     try:
         mol = Chem.MolFromInchi(inchi)
         if mol is None:
@@ -79,7 +79,7 @@ def process_single_inchi(args):
         y = torch.tensor(np.asarray(fp, dtype=np.int8)).unsqueeze(0)
         inchi_canonical = Chem.MolToInchi(mol)
         data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y, idx=i, inchi=inchi_canonical)
-        
+
         if filter_dataset:
             # Filtering: rebuild the molecule from the graph
             batch = getattr(data, 'batch', torch.zeros(data.x.size(0), dtype=torch.long))
@@ -115,7 +115,7 @@ def process_single_inchi(args):
 atom_decoder = ['C', 'O', 'P', 'N', 'S', 'Cl', 'F', 'H']
 valency = [ATOM_TO_VALENCY.get(atom, 0) for atom in atom_decoder]
 
-# Data sources: 
+# Data sources:
 # HMDB: https://hmdb.ca/downloads
 # DSSTox: https://clowder.edap-cluster.com/datasets/61147fefe4b0856fdc65639b#folderId=6616d85ce4b063812d70fc8f
 # COCONUT: https://zenodo.org/records/13692394
@@ -139,7 +139,7 @@ class FP2MolDataset(InMemoryDataset):
         else: raise ValueError(f"Invalid stage {self.stage}")
 
         super().__init__(root, None, pre_transform, pre_filter)
-        self.data, self.slices = torch.load(self.processed_paths[self.file_idx])
+        self.data, self.slices = torch.load(self.processed_paths[self.file_idx], weights_only=False)
 
     @property
     def processed_dir(self):
@@ -234,7 +234,7 @@ class FP2Mol_infos(AbstractDatasetInfos):
                           node_types=f'{datamodule._root_path}/stats/atom_types.txt',
                           edge_types=f'{datamodule._root_path}/stats/edge_types.txt',
                           valency_distribution=f'{datamodule._root_path}/stats/valencies.txt')
-        
+
         # n_nodes and valency_distribution are not transferrable between datatsets because of shape mismatches
         if cfg.dataset.stats_dir:
             meta_read = dict(n_nodes=f'{datamodule._root_path}/stats/n_counts.txt',
@@ -246,7 +246,7 @@ class FP2Mol_infos(AbstractDatasetInfos):
                           node_types=f'{datamodule._root_path}/stats/atom_types.txt',
                           edge_types=f'{datamodule._root_path}/stats/edge_types.txt',
                           valency_distribution=f'{datamodule._root_path}/stats/valencies.txt')
-            
+
 
         self.n_nodes = None
         self.node_types = None

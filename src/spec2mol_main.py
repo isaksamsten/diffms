@@ -20,6 +20,7 @@ from pytorch_lightning.utilities.warnings import PossibleUserWarning
 
 from src import utils
 from src.diffusion_model_spec2mol import Spec2MolDenoisingDiffusion
+from src.diffusion_model_spec2mol_fm import Spec2MolFlowMatching
 from src.diffusion.extra_features import DummyExtraFeatures, ExtraFeatures
 from src.metrics.molecular_metrics_discrete import TrainMolecularMetricsDiscrete
 from src.diffusion.extra_features_molecular import ExtraMolecularFeatures
@@ -39,7 +40,9 @@ def get_resume(cfg, model_kwargs):
     test_samples_to_generate = cfg.general.test_samples_to_generate
     gpus = cfg.general.gpus
 
-    model = Spec2MolDenoisingDiffusion.load_from_checkpoint(resume, **model_kwargs)
+    model_type = getattr(cfg.model, 'model_type', 'diffusion')
+    model_cls = Spec2MolFlowMatching if model_type == 'flow_matching' else Spec2MolDenoisingDiffusion
+    model = model_cls.load_from_checkpoint(resume, **model_kwargs)
 
     cfg = model.cfg
     cfg.general.test_only = resume
@@ -60,7 +63,9 @@ def get_resume_adaptive(cfg, model_kwargs):
 
     resume_path = os.path.join(root_dir, cfg.general.resume)
 
-    model = Spec2MolDenoisingDiffusion.load_from_checkpoint(resume_path, **model_kwargs)
+    model_type = getattr(cfg.model, 'model_type', 'diffusion')
+    model_cls = Spec2MolFlowMatching if model_type == 'flow_matching' else Spec2MolDenoisingDiffusion
+    model = model_cls.load_from_checkpoint(resume_path, **model_kwargs)
     
     new_cfg = model.cfg
 
@@ -224,7 +229,13 @@ def main(cfg: DictConfig):
     os.makedirs('logs/', exist_ok=True)
     os.makedirs('logs/' + cfg.general.name, exist_ok=True)
 
-    model = Spec2MolDenoisingDiffusion(cfg=cfg, **model_kwargs)
+    model_type = getattr(cfg.model, 'model_type', 'diffusion')
+    if model_type == 'flow_matching':
+        logging.info("Using Discrete Flow Matching model")
+        model = Spec2MolFlowMatching(cfg=cfg, **model_kwargs)
+    else:
+        logging.info("Using D3PM Discrete Diffusion model")
+        model = Spec2MolDenoisingDiffusion(cfg=cfg, **model_kwargs)
 
     callbacks = []
     callbacks.append(LearningRateMonitor(logging_interval='step'))

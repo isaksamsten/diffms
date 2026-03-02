@@ -1,13 +1,13 @@
 # Model settings
-transition: 'marginal' 
-model: 'graph_tf'           # 'graph_tf', 'graph_tf_v2',       
+transition: 'marginal'
+model: 'graph_tf'           # 'graph_tf', 'graph_tf_v2',
 diffusion_steps: 500
-diffusion_noise_schedule: 'cosine'         
+diffusion_noise_schedule: 'cosine'
 n_layers: 5
 
-extra_features: 'all'        # 'all', 'cycles', 'eigenvalues' or null
+extra_features: null        # 'all', 'cycles', 'eigenvalues' or null
 
-hidden_mlp_dims: {'X': 256, 'E': 128, 'y': 2048}        
+hidden_mlp_dims: {'X': 256, 'E': 128, 'y': 2048}
 
 hidden_dims : {'dx': 256, 'de': 64, 'dy': 1024, 'n_head': 8, 'dim_ffX': 256, 'dim_ffE': 128, 'dim_ffy': 1024}
 
@@ -18,3 +18,12 @@ encoder_magma_modulo: 512         # Small Model Default (CANOPUS)
 #encoder_magma_modulo: 2048       # Large Model Default (MSG)
 
 lambda_train: [0, 1, 0]
+
+# Flow matching settings (used when model_type='flow_matching')
+model_type: 'flow_matching'           # 'diffusion' (D3PM) or 'flow_matching' (DFM)
+flow_matching_steps: 50           # Number of Euler sampling steps (vs 500 for D3PM)
+
+# Cross-attention: let graph nodes attend to individual spectral peak tokens
+# from the encoder, providing fine-grained conditioning beyond the global vector.
+# Only used in Stage 2 (Spec→Mol); ignored in Stage 1 (no spectra).
+cross_attention: false

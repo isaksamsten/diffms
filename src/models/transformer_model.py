@@ -10,7 +10,7 @@ from torch import Tensor
 
 from src import utils
 from src.diffusion import diffusion_utils
-from src.models.layers import Xtoy, Etoy, masked_softmax
+from src.models.layers import Xtoy, Etoy, masked_softmax, SpectraCrossAttention
 
 
 class XEyTransformerLayer(nn.Module):
@@ -25,11 +25,19 @@ class XEyTransformerLayer(nn.Module):
     """
     def __init__(self, dx: int, de: int, dy: int, n_head: int, dim_ffX: int = 2048,
                  dim_ffE: int = 128, dim_ffy: int = 2048, dropout: float = 0.1,
-                 layer_norm_eps: float = 1e-5, device=None, dtype=None) -> None:
+                 layer_norm_eps: float = 1e-5, device=None, dtype=None,
+                 cross_attention: bool = False, d_peak: int = 256) -> None:
         kw = {'device': device, 'dtype': dtype}
         super().__init__()
 
         self.self_attn = NodeEdgeBlock(dx, de, dy, n_head, **kw)
+
+        # Optional cross-attention to spectral peak tokens
+        self.cross_attn = None
+        if cross_attention:
+            self.cross_attn = SpectraCrossAttention(
+                dx=dx, d_peak=d_peak, n_head=n_head, dropout=dropout,
+            )
 
         self.linX1 = Linear(dx, dim_ffX, **kw)
         self.linX2 = Linear(dim_ffX, dx, **kw)
@@ -57,12 +65,15 @@ class XEyTransformerLayer(nn.Module):
 
         self.activation = F.relu
 
-    def forward(self, X: Tensor, E: Tensor, y, node_mask: Tensor):
+    def forward(self, X: Tensor, E: Tensor, y, node_mask: Tensor,
+                peak_tokens: Tensor = None, peak_mask: Tensor = None):
         """ Pass the input through the encoder layer.
             X: (bs, n, d)
             E: (bs, n, n, d)
             y: (bs, dy)
             node_mask: (bs, n) Mask for the src keys per batch (optional)
+            peak_tokens: (bs, Np, d_peak) Optional spectral peak features for cross-attention.
+            peak_mask: (bs, Np) Optional mask for valid peaks (True = valid).
             Output: newX, newE, new_y with the same shape.
         """
 
@@ -70,6 +81,10 @@ class XEyTransformerLayer(nn.Module):
 
         newX_d = self.dropoutX1(newX)
         X = self.normX1(X + newX_d)
+
+        # Cross-attention to spectral peak tokens (when available)
+        if self.cross_attn is not None and peak_tokens is not None:
+            X = self.cross_attn(X, peak_tokens, node_mask, peak_mask)
 
         newE_d = self.dropoutE1(newE)
         E = self.normE1(E + newE_d)
@@ -414,7 +429,8 @@ class GraphTransformer(nn.Module):
     dims : dict -- contains dimensions for each feature type
     """
     def __init__(self, n_layers: int, input_dims: dict, hidden_mlp_dims: dict, hidden_dims: dict,
-                 output_dims: dict, act_fn_in=nn.ReLU(), act_fn_out=nn.ReLU(), **kwargs):
+                 output_dims: dict, act_fn_in=nn.ReLU(), act_fn_out=nn.ReLU(),
+                 cross_attention: bool = False, d_peak: int = 256, **kwargs):
         super().__init__()
         self.n_layers = n_layers
         self.out_dim_X = output_dims['X']
@@ -436,7 +452,9 @@ class GraphTransformer(nn.Module):
                                                             n_head=hidden_dims['n_head'],
                                                             dim_ffX=hidden_dims['dim_ffX'],
                                                             dim_ffE=hidden_dims['dim_ffE'],
-                                                            dim_ffy=hidden_dims['dim_ffy'],)
+                                                            dim_ffy=hidden_dims['dim_ffy'],
+                                                            cross_attention=cross_attention,
+                                                            d_peak=d_peak,)
                                         for i in range(n_layers)])
 
         self.mlp_out_X = nn.Sequential(nn.Linear(hidden_dims['dx'], hidden_mlp_dims['X']), act_fn_out,
@@ -448,7 +466,7 @@ class GraphTransformer(nn.Module):
         self.mlp_out_y = nn.Sequential(nn.Linear(hidden_dims['dy'], hidden_mlp_dims['y']), act_fn_out,
                                        nn.Linear(hidden_mlp_dims['y'], output_dims['y']))
 
-    def forward(self, X, E, y, node_mask):
+    def forward(self, X, E, y, node_mask, peak_tokens=None, peak_mask=None):
         bs, n = X.shape[0], X.shape[1]
 
         diag_mask = torch.eye(n)
@@ -465,7 +483,8 @@ class GraphTransformer(nn.Module):
         X, E, y = after_in.X, after_in.E, after_in.y
 
         for layer in self.tf_layers:
-            X, E, y = layer(X, E, y, node_mask)
+            X, E, y = layer(X, E, y, node_mask,
+                            peak_tokens=peak_tokens, peak_mask=peak_mask)
 
         X = self.mlp_out_X(X)
         E = self.mlp_out_E(E)
