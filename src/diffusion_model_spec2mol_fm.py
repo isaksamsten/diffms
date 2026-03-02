@@ -15,7 +15,6 @@ The encoder, decoder (GraphTransformer), merge layer, and all metrics are
 reused unchanged from the original model.
 """
 
-import os
 import time
 import logging
 import pickle
@@ -28,9 +27,7 @@ from torch_geometric.data import Batch
 from rdkit import Chem
 
 from models.transformer_model import GraphTransformer
-from src.diffusion import diffusion_utils
-from metrics.train_metrics import TrainLossDiscrete
-from metrics.abstract_metrics import SumExceptBatchMetric, SumExceptBatchKL, NLL, CrossEntropyMetric
+from metrics.abstract_metrics import CrossEntropyMetric
 from src.metrics.diffms_metrics import K_ACC_Collection, K_SimilarityCollection, Validity
 from src import utils
 from src.mist.models.spectra_encoder import SpectraEncoderGrowing
@@ -77,31 +74,25 @@ class Spec2MolFlowMatching(pl.LightningModule):
         self.dataset_info = dataset_infos
 
         # --- Training loss ---
-        # We keep the TrainLossDiscrete for logging compatibility, but the actual
-        # loss is computed via flow matching cross-entropy.
+        # Flow matching loss is computed directly via compute_flow_matching_loss.
         self.lambda_train = cfg.model.lambda_train
-        self.train_loss = TrainLossDiscrete(self.lambda_train)
 
-        # --- Validation / test metrics (reused from original) ---
-        self.val_nll = NLL()
-        self.val_X_kl = SumExceptBatchKL()
-        self.val_E_kl = SumExceptBatchKL()
-        self.val_X_logp = SumExceptBatchMetric()
-        self.val_E_logp = SumExceptBatchMetric()
+        # --- Validation / test metrics ---
+        # Flow matching has no KL / logp decomposition. We track:
+        #   - X_CE / E_CE: per-component cross-entropy (fast, every epoch)
+        #   - FM loss as a scalar (logged as val/loss)
+        #   - Sampling-based metrics: acc_at_k, tanimoto, cosine, validity
+        self.val_X_CE = CrossEntropyMetric()
+        self.val_E_CE = CrossEntropyMetric()
         self.val_k_acc = K_ACC_Collection(list(range(1, self.val_num_samples + 1)))
         self.val_sim_metrics = K_SimilarityCollection(list(range(1, self.val_num_samples + 1)))
         self.val_validity = Validity()
-        self.val_CE = CrossEntropyMetric()
 
-        self.test_nll = NLL()
-        self.test_X_kl = SumExceptBatchKL()
-        self.test_E_kl = SumExceptBatchKL()
-        self.test_X_logp = SumExceptBatchMetric()
-        self.test_E_logp = SumExceptBatchMetric()
+        self.test_X_CE = CrossEntropyMetric()
+        self.test_E_CE = CrossEntropyMetric()
         self.test_k_acc = K_ACC_Collection(list(range(1, self.test_num_samples + 1)))
         self.test_sim_metrics = K_SimilarityCollection(list(range(1, self.test_num_samples + 1)))
         self.test_validity = Validity()
-        self.test_CE = CrossEntropyMetric()
 
         self.train_metrics = train_metrics
         self.visualization_tools = visualization_tools
@@ -206,7 +197,6 @@ class Spec2MolFlowMatching(pl.LightningModule):
         self.train_iterations = None
         self.val_iterations = None
         self.log_every_steps = cfg.general.log_every_steps
-        self.best_val_nll = 1e8
         self.val_counter = 1
 
     # ================================================================
@@ -362,16 +352,18 @@ class Spec2MolFlowMatching(pl.LightningModule):
 
         val_loss = compute_flow_matching_loss(pred, X, E, node_mask, self.lambda_train)
 
-        # Edge cross-entropy for monitoring
+        # Per-component cross-entropy for monitoring
+        true_X_flat = X.reshape(-1, X.size(-1))
+        pred_X_flat = pred.X.reshape(-1, pred.X.size(-1))
+        mask_X = (true_X_flat != 0.).any(dim=-1)
+        if mask_X.any():
+            self.val_X_CE(pred_X_flat[mask_X], true_X_flat[mask_X])
+
         true_E_flat = E.reshape(-1, E.size(-1))
         pred_E_flat = pred.E.reshape(-1, pred.E.size(-1))
         mask_E = (true_E_flat != 0.).any(dim=-1)
         if mask_E.any():
-            self.val_CE(pred_E_flat[mask_E], true_E_flat[mask_E])
-
-        # Track loss as NLL-equivalent (expand scalar to batch for proper averaging)
-        batch_loss = val_loss.detach().expand(X.size(0))
-        self.val_nll(batch_loss)
+            self.val_E_CE(pred_E_flat[mask_E], true_E_flat[mask_E])
 
         # Sampling-based evaluation (periodic)
         if self.val_counter % self.cfg.general.sample_every_val == 0:
@@ -499,14 +491,18 @@ class Spec2MolFlowMatching(pl.LightningModule):
 
         val_loss = compute_flow_matching_loss(pred, X, E, node_mask, self.lambda_train)
 
+        # Per-component cross-entropy for monitoring
+        true_X_flat = X.reshape(-1, X.size(-1))
+        pred_X_flat = pred.X.reshape(-1, pred.X.size(-1))
+        mask_X = (true_X_flat != 0.).any(dim=-1)
+        if mask_X.any():
+            self.test_X_CE(pred_X_flat[mask_X], true_X_flat[mask_X])
+
         true_E_flat = E.reshape(-1, E.size(-1))
         pred_E_flat = pred.E.reshape(-1, pred.E.size(-1))
         mask_E = (true_E_flat != 0.).any(dim=-1)
         if mask_E.any():
-            self.test_CE(pred_E_flat[mask_E], true_E_flat[mask_E])
-
-        batch_loss = val_loss.detach().expand(X.size(0))
-        self.test_nll(batch_loss)
+            self.test_E_CE(pred_E_flat[mask_E], true_E_flat[mask_E])
 
         true_mols = [Chem.inchi.MolFromInchi(data.get_example(idx).inchi) for idx in range(len(data))]
         predicted_mols = [list() for _ in range(len(data))]
@@ -556,13 +552,11 @@ class Spec2MolFlowMatching(pl.LightningModule):
 
     def on_train_epoch_start(self) -> None:
         self.start_epoch_time = time.time()
-        self.train_loss.reset()
         self.train_metrics.reset()
 
     def on_train_epoch_end(self) -> None:
-        to_log = self.train_loss.log_epoch_metrics()
-        to_log["train_epoch/epoch"] = float(self.current_epoch)
-        to_log["train_epoch/time"] = time.time() - self.start_epoch_time
+        to_log = {"train_epoch/epoch": float(self.current_epoch),
+                  "train_epoch/time": time.time() - self.start_epoch_time}
 
         epoch_at_metrics, epoch_bond_metrics = self.train_metrics.log_epoch_metrics()
         for key, value in epoch_at_metrics.items():
@@ -577,16 +571,16 @@ class Spec2MolFlowMatching(pl.LightningModule):
                          f" -- time: {to_log['train_epoch/time']:.2f}")
 
     def on_validation_epoch_start(self) -> None:
-        self.val_nll.reset()
-        self.val_X_kl.reset()
-        self.val_E_kl.reset()
-        self.val_X_logp.reset()
-        self.val_E_logp.reset()
+        self.val_X_CE.reset()
+        self.val_E_CE.reset()
+        self.val_k_acc.reset()
+        self.val_sim_metrics.reset()
+        self.val_validity.reset()
 
     def on_validation_epoch_end(self) -> None:
         metrics = {
-            "val/E_CE": self.val_CE.compute(),
-            "val/NLL": self.val_nll.compute(),
+            "val/X_CE": self.val_X_CE.compute(),
+            "val/E_CE": self.val_E_CE.compute(),
         }
 
         if self.val_counter % self.cfg.general.sample_every_val == 0:
@@ -599,33 +593,29 @@ class Spec2MolFlowMatching(pl.LightningModule):
         self.log_dict(metrics, sync_dist=True)
 
         if self.global_rank == 0:
-            logging.info(f"Epoch {self.current_epoch}: Val E_CE {metrics.get('val/E_CE', -1):.4f}"
-                         f" -- Val NLL {metrics.get('val/NLL', -1):.4f}")
+            logging.info(f"Epoch {self.current_epoch}: Val X_CE {metrics.get('val/X_CE', -1):.4f}"
+                         f" -- Val E_CE {metrics.get('val/E_CE', -1):.4f}")
 
         self.val_counter += 1
 
     def on_test_epoch_start(self) -> None:
         if self.global_rank == 0:
             logging.info("Starting test...")
-        self.test_nll.reset()
-        self.test_X_kl.reset()
-        self.test_E_kl.reset()
-        self.test_X_logp.reset()
-        self.test_E_logp.reset()
+        self.test_X_CE.reset()
+        self.test_E_CE.reset()
         self.test_k_acc.reset()
         self.test_sim_metrics.reset()
         self.test_validity.reset()
-        self.test_CE.reset()
 
     def on_test_epoch_end(self) -> None:
         metrics = {
-            "test/E_CE": self.test_CE.compute(),
-            "test/NLL": self.test_nll.compute(),
+            "test/X_CE": self.test_X_CE.compute(),
+            "test/E_CE": self.test_E_CE.compute(),
         }
 
         self.log_dict(metrics, sync_dist=True)
         if self.global_rank == 0:
-            logging.info(f"Test E_CE: {metrics['test/E_CE']:.4f} -- Test NLL: {metrics['test/NLL']:.4f}")
+            logging.info(f"Test X_CE: {metrics['test/X_CE']:.4f} -- Test E_CE: {metrics['test/E_CE']:.4f}")
 
         log_dict = {}
         for key, value in self.test_k_acc.compute().items():
