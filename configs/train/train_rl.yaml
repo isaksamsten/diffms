@@ -21,11 +21,11 @@ rl_finetuning: true
 # RL algorithm: 'reinforce' | 'grpo'
 rl_algorithm: 'reinforce'
 
-# Reward function: 'validity' | 'qed' | 'sa' | 'logp' | 'mw' | 'tanimoto' | 'composite'
+# Reward function: 'validity' | 'mw' | 'tanimoto' | 'composite'
 rl_reward: 'validity'
 
-# Weights for composite reward (order: validity, qed, sa)
-rl_reward_weights: [0.3, 0.5, 0.2]
+# Weights for composite reward (order: validity, mw)
+rl_reward_weights: [0.7, 0.3]
 
 # Target SMILES for tanimoto reward
 rl_reward_target_smiles: null

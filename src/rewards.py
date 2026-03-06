@@ -62,57 +62,6 @@ class ValidityReward(RewardFunction):
             return 0.0
 
 
-class QEDReward(RewardFunction):
-
-    def __call__(self, mol):
-        if mol is None:
-            return 0.0
-        try:
-            Chem.SanitizeMol(mol)
-            return float(_get_qed().qed(mol))
-        except Exception:
-            return 0.0
-
-
-class SAReward(RewardFunction):
-
-    def __call__(self, mol):
-        if mol is None:
-            return 0.0
-        scorer = _get_sa_scorer()
-        if scorer is None:
-            return 0.0
-        try:
-            Chem.SanitizeMol(mol)
-            sa = scorer.calculateScore(mol)
-            return max(0.0, (10.0 - sa) / 9.0)
-        except Exception:
-            return 0.0
-
-
-class LogPReward(RewardFunction):
-
-    def __init__(self, target: float = 2.5, low: float = 0.0, high: float = 5.0):
-        self.target = target
-        self.low = low
-        self.high = high
-
-    def __call__(self, mol):
-        if mol is None:
-            return 0.0
-        try:
-            logp = Descriptors.MolLogP(mol)
-            if self.low <= logp <= self.high:
-                half_range = (self.high - self.low) / 2.0
-                return max(0.0, 1.0 - abs(logp - self.target) / half_range)
-            return 0.0
-        except Exception:
-            return 0.0
-
-    def __repr__(self):
-        return f"LogPReward(target={self.target}, low={self.low}, high={self.high})"
-
-
 class MolecularWeightReward(RewardFunction):
 
     def __init__(self, target: float = 350.0, low: float = 150.0, high: float = 500.0):
@@ -173,12 +122,6 @@ def build_reward_from_cfg(cfg) -> RewardFunction:
 
     if name == 'validity':
         return ValidityReward()
-    elif name == 'qed':
-        return QEDReward()
-    elif name == 'sa':
-        return SAReward()
-    elif name == 'logp':
-        return LogPReward()
     elif name == 'mw':
         return MolecularWeightReward()
     elif name == 'tanimoto':
@@ -186,7 +129,7 @@ def build_reward_from_cfg(cfg) -> RewardFunction:
         return TanimotoToTargetReward(target)
     elif name == 'composite':
         weights = list(cfg.train.rl_reward_weights)
-        rewards = [ValidityReward(), QEDReward(), SAReward()]
+        rewards = [ValidityReward(), MolecularWeightReward()]
         assert len(weights) == len(rewards), \
             f"rl_reward_weights has {len(weights)} entries, expected {len(rewards)}"
         return CompositeReward(rewards, weights)
