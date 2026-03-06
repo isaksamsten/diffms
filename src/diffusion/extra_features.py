@@ -71,6 +71,28 @@ class NodeCycleFeatures:
         return x_cycles, y_cycles
 
 
+def _safe_eigvalsh(L, max_retries=5, jitter=1e-6):
+    """torch.linalg.eigvalsh with automatic retry on ill-conditioned matrices."""
+    for i in range(max_retries):
+        try:
+            return torch.linalg.eigvalsh(L)
+        except torch._C._LinAlgError:
+            L = L + jitter * torch.eye(L.shape[-1], device=L.device, dtype=L.dtype).unsqueeze(0)
+            jitter *= 10
+    return torch.linalg.eigvalsh(L)
+
+
+def _safe_eigh(L, max_retries=5, jitter=1e-6):
+    """torch.linalg.eigh with automatic retry on ill-conditioned matrices."""
+    for i in range(max_retries):
+        try:
+            return torch.linalg.eigh(L)
+        except torch._C._LinAlgError:
+            L = L + jitter * torch.eye(L.shape[-1], device=L.device, dtype=L.dtype).unsqueeze(0)
+            jitter *= 10
+    return torch.linalg.eigh(L)
+
+
 class EigenFeatures:
     """
     Code taken from : https://github.com/Saro00/DGN/blob/master/models/pytorch/eigen_agg.py
@@ -89,14 +111,14 @@ class EigenFeatures:
         L = L * mask.unsqueeze(1) * mask.unsqueeze(2) + mask_diag
 
         if self.mode == 'eigenvalues':
-            eigvals = torch.linalg.eigvalsh(L)        # bs, n
+            eigvals = _safe_eigvalsh(L)        # bs, n
             eigvals = eigvals.type_as(A) / torch.sum(mask, dim=1, keepdim=True)
 
             n_connected_comp, batch_eigenvalues = get_eigenvalues_features(eigenvalues=eigvals)
             return n_connected_comp.type_as(A), batch_eigenvalues.type_as(A)
 
         elif self.mode == 'all':
-            eigvals, eigvectors = torch.linalg.eigh(L)
+            eigvals, eigvectors = _safe_eigh(L)
             eigvals = eigvals.type_as(A) / torch.sum(mask, dim=1, keepdim=True)
             eigvectors = eigvectors * mask.unsqueeze(2) * mask.unsqueeze(1)
             # Retrieve eigenvalues features

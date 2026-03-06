@@ -98,10 +98,10 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
 
         try:
             if cfg.general.decoder is not None:
-                state_dict = torch.load(cfg.general.decoder, map_location='cpu')
+                state_dict = torch.load(cfg.general.decoder, map_location='cpu', weights_only=False)
                 if 'state_dict' in state_dict:
                     state_dict = state_dict['state_dict']
-                    
+
                 cleaned_state_dict = {}
                 for k, v in state_dict.items():
                     if k.startswith('model.'):
@@ -110,14 +110,14 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
 
                 self.decoder.load_state_dict(cleaned_state_dict, strict=not self.use_cross_attention)
         except Exception as e:
-            logging.info(f"Could not load decoder: {e}")
+            raise RuntimeError(f"Failed to load pretrained decoder from '{cfg.general.decoder}': {e}")
 
         magma_modulo = 512
         try:
             magma_modulo = cfg.model.encoder_magma_modulo
         except:
             print("No magma modulo specified, using default value of 512")
-        
+
         self.encoder = SpectraEncoderGrowing(
                         inten_transform='float',
                         inten_prob=0.1,
@@ -138,12 +138,12 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                         refine_layers=4,
                         magma_modulo=magma_modulo,
                     )
-        
+
         try:
             if cfg.general.encoder is not None:
-                self.encoder.load_state_dict(torch.load(cfg.general.encoder), strict=True)
+                self.encoder.load_state_dict(torch.load(cfg.general.encoder, weights_only=False), strict=True)
         except Exception as e:
-            logging.info(f"Could not load encoder: {e}")
+            raise RuntimeError(f"Failed to load pretrained encoder from '{cfg.general.encoder}': {e}")
 
         self.noise_schedule = PredefinedNoiseScheduleDiscrete(cfg.model.diffusion_noise_schedule, timesteps=cfg.model.diffusion_steps)
         self.denoise_nodes = getattr(cfg.dataset, 'denoise_nodes', False)
@@ -206,7 +206,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         loss = self.train_loss(masked_pred_X=pred.X, masked_pred_E=pred.E, pred_y=pred.y,
                                true_X=X, true_E=E, true_y=data.y,
                                log=False)
- 
+
         self.train_metrics(masked_pred_X=pred.X, masked_pred_E=pred.E, true_X=X, true_E=E,
                            log=False)
 
@@ -234,7 +234,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         if self.global_rank == 0:
             logging.info(f"Size of the input features: X-{self.Xdim}, E-{self.Edim}, y-{self.ydim}")
         self.train_iterations = len(self.trainer.datamodule.train_dataloader())
-        
+
     def on_train_epoch_start(self) -> None:
         self.start_epoch_time = time.time()
         self.train_loss.reset()
@@ -303,7 +303,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             for _ in range(self.val_num_samples):
                 for idx, mol in enumerate(self.sample_batch(data)):
                     predicted_mols[idx].append(mol)
-        
+
             for idx in range(len(data)):
                 self.val_k_acc.update(predicted_mols[idx], true_mols[idx])
                 self.val_sim_metrics.update(predicted_mols[idx], true_mols[idx])
@@ -313,10 +313,10 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
 
     def on_validation_epoch_end(self) -> None:
         metrics = [
-            self.val_nll.compute(), 
-            self.val_X_kl.compute(), 
+            self.val_nll.compute(),
+            self.val_X_kl.compute(),
             self.val_E_kl.compute(),
-            self.val_X_logp.compute(), 
+            self.val_X_logp.compute(),
             self.val_E_logp.compute(),
             self.val_CE.compute()
         ]
@@ -347,7 +347,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                 self.best_val_nll = val_nll
             logging.info(f"Val NLL: {val_nll :.4f} \t Best Val NLL:  {self.best_val_nll}")
 
-    
+
     def on_test_epoch_start(self) -> None:
         if self.global_rank == 0:
             logging.info("Starting test...")
@@ -400,7 +400,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             pickle.dump(predicted_mols, f)
         with open(f"preds/{self.name}_rank_{self.global_rank}_true_{i}.pkl", "wb") as f:
             pickle.dump(true_mols, f)
-        
+
         for idx in range(len(data)):
             self.test_k_acc.update(predicted_mols[idx], true_mols[idx])
             self.test_sim_metrics.update(predicted_mols[idx], true_mols[idx])
@@ -411,10 +411,10 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
     def on_test_epoch_end(self) -> None:
         """ Measure likelihood on a test set and compute stability metrics. """
         metrics = [
-            self.test_nll.compute(), 
-            self.test_X_kl.compute(), 
+            self.test_nll.compute(),
+            self.test_X_kl.compute(),
             self.test_E_kl.compute(),
-            self.test_X_logp.compute(), 
+            self.test_X_logp.compute(),
             self.test_E_logp.compute(),
             self.test_CE.compute()
         ]
@@ -440,8 +440,8 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         log_dict["test/validity"] = self.test_validity.compute()
 
         self.log_dict(log_dict, sync_dist=True)
-        
-        
+
+
     def kl_prior(self, X, E, node_mask):
         """Computes the KL between q(z1 | x) and the prior p(z1) = Normal(0, 1).
 
@@ -659,7 +659,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         y = torch.hstack((noisy_data['y_t'], extra_data.y)).float()
         return self.decoder(X, E, y, node_mask,
                             peak_tokens=peak_tokens, peak_mask=peak_mask)
-    
+
     @torch.no_grad()
     def sample_batch(self, data: Batch) -> Batch:
         dense_data, node_mask = utils.to_dense(data.x, data.edge_index, data.edge_attr, data.batch)
@@ -690,6 +690,250 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             mols.append(self.visualization_tools.mol_from_graphs(nodes, adj_mat))
 
         return mols
+
+    # ================================================================
+    # SAMPLING WITH LOG-PROBABILITIES (for RL finetuning)
+    # ================================================================
+    def _sample_discrete_features_with_log_prob(self, probX, probE, node_mask):
+        """Like diffusion_utils.sample_discrete_features, but also returns log-prob.
+
+        Returns:
+            X_t: (bs, n) sampled node indices
+            E_t: (bs, n, n) sampled edge indices (symmetrised)
+            log_prob: (bs,) sum of log-probs over valid positions
+        """
+        bs, n, _ = probX.shape
+
+        # --- Nodes ---
+        probX_clean = probX.clone()
+        probX_clean[~node_mask] = 1.0 / probX.shape[-1]
+        probX_flat = probX_clean.reshape(bs * n, -1).clamp(min=1e-8)
+        probX_flat = probX_flat / probX_flat.sum(dim=-1, keepdim=True)
+
+        X_t = probX_flat.multinomial(1).squeeze(-1)  # (bs * n,)
+        lp_X = torch.log(probX_flat.gather(1, X_t.unsqueeze(1)).squeeze(1) + 1e-10)
+        lp_X = lp_X.reshape(bs, n) * node_mask.float()
+
+        X_t = X_t.reshape(bs, n)
+
+        # --- Edges ---
+        inverse_edge_mask = ~(node_mask.unsqueeze(1) * node_mask.unsqueeze(2))
+        diag_mask = torch.eye(n, device=probE.device).bool().unsqueeze(0).expand(bs, -1, -1)
+
+        probE_clean = probE.clone()
+        probE_clean[inverse_edge_mask] = 1.0 / probE.shape[-1]
+        probE_clean[diag_mask] = 1.0 / probE.shape[-1]
+
+        probE_flat = probE_clean.reshape(bs * n * n, -1).clamp(min=1e-8)
+        probE_flat = probE_flat / probE_flat.sum(dim=-1, keepdim=True)
+
+        E_t = probE_flat.multinomial(1).squeeze(-1).reshape(bs, n, n)
+        lp_E = torch.log(probE_flat.gather(1, E_t.reshape(-1, 1)).squeeze(1) + 1e-10)
+        lp_E = lp_E.reshape(bs, n, n)
+
+        # Symmetrise edges
+        E_t = torch.triu(E_t, diagonal=1)
+        E_t = E_t + E_t.transpose(1, 2)
+
+        # Only count upper-triangle log-probs (lower is deterministic copy)
+        upper_mask = torch.triu(torch.ones(n, n, device=probE.device), diagonal=1).bool()
+        upper_mask = upper_mask.unsqueeze(0).expand(bs, -1, -1)
+        edge_valid = node_mask.unsqueeze(1) * node_mask.unsqueeze(2)
+        lp_E = lp_E * upper_mask.float() * edge_valid.float()
+
+        log_prob = lp_X.sum(dim=-1) + lp_E.reshape(bs, -1).sum(dim=-1)  # (bs,)
+
+        return X_t, E_t, log_prob
+
+    def sample_p_zs_given_zt_with_log_prob(self, s, t, X_t, E_t, y_t, node_mask):
+        """Like sample_p_zs_given_zt but returns per-example log-probability.
+
+        Returns:
+            out_one_hot: PlaceHolder with one-hot X_s, E_s
+            log_prob: (bs,) sum of log-probs for the sampling decisions
+        """
+        bs, n, dxs = X_t.shape
+        beta_t = self.noise_schedule(t_normalized=t)
+        alpha_s_bar = self.noise_schedule.get_alpha_bar(t_normalized=s)
+        alpha_t_bar = self.noise_schedule.get_alpha_bar(t_normalized=t)
+
+        Qtb = self.transition_model.get_Qt_bar(alpha_t_bar, self.device)
+        Qsb = self.transition_model.get_Qt_bar(alpha_s_bar, self.device)
+        Qt = self.transition_model.get_Qt(beta_t, self.device)
+
+        # Neural net predictions (gradients flow here)
+        noisy_data = {'X_t': X_t, 'E_t': E_t, 'y_t': y_t, 't': t, 'node_mask': node_mask}
+        extra_data = self.compute_extra_data(noisy_data)
+        peak_tokens, peak_mask = self._get_peak_context()
+        pred = self.forward(noisy_data, extra_data, node_mask,
+                            peak_tokens=peak_tokens, peak_mask=peak_mask)
+
+        pred_X = F.softmax(pred.X, dim=-1)
+        pred_E = F.softmax(pred.E, dim=-1)
+
+        # Posterior p(z_s | z_t, x_0)
+        p_s_and_t_given_0_X = diffusion_utils.compute_batched_over0_posterior_distribution(
+            X_t=X_t, Qt=Qt.X, Qsb=Qsb.X, Qtb=Qtb.X)
+        p_s_and_t_given_0_E = diffusion_utils.compute_batched_over0_posterior_distribution(
+            X_t=E_t, Qt=Qt.E, Qsb=Qsb.E, Qtb=Qtb.E)
+
+        # Compute p(z_s | z_t) = sum_{x_0} p(x_0|z_t) * p(z_s | z_t, x_0)
+        weighted_X = pred_X.unsqueeze(-1) * p_s_and_t_given_0_X
+        unnormalized_prob_X = weighted_X.sum(dim=2)
+        unnormalized_prob_X[torch.sum(unnormalized_prob_X, dim=-1) == 0] = 1e-5
+        prob_X = unnormalized_prob_X / torch.sum(unnormalized_prob_X, dim=-1, keepdim=True)
+
+        pred_E = pred_E.reshape((bs, -1, pred_E.shape[-1]))
+        weighted_E = pred_E.unsqueeze(-1) * p_s_and_t_given_0_E
+        unnormalized_prob_E = weighted_E.sum(dim=-2)
+        unnormalized_prob_E[torch.sum(unnormalized_prob_E, dim=-1) == 0] = 1e-5
+        prob_E = unnormalized_prob_E / torch.sum(unnormalized_prob_E, dim=-1, keepdim=True)
+        prob_E = prob_E.reshape(bs, n, n, pred_E.shape[-1])
+
+        # Sample with log-probs
+        X_s_idx, E_s_idx, log_prob = self._sample_discrete_features_with_log_prob(
+            prob_X, prob_E, node_mask)
+
+        X_s = F.one_hot(X_s_idx, num_classes=self.Xdim_output).float()
+        E_s = F.one_hot(E_s_idx, num_classes=self.Edim_output).float()
+
+        out_one_hot = utils.PlaceHolder(X=X_s, E=E_s, y=torch.zeros(y_t.shape[0], 0))
+        return out_one_hot.mask(node_mask).type_as(y_t), log_prob
+
+    def sample_batch_with_log_probs(self, data: Batch):
+        """Generate molecules while tracking a differentiable log-probability.
+
+        Memory-efficient implementation: runs the full T-step reverse sampling
+        with torch.no_grad(), records the sampled z_t at each step, then
+        **re-evaluates a single randomly chosen step** with gradients enabled.
+
+        This gives an unbiased single-sample estimate of ∇θ log π(τ) via
+        REINFORCE, using only O(1) backward-pass memory instead of O(T).
+
+        Args:
+            data: PyG Batch (already has .y set by encoder/merge).
+
+        Returns:
+            mols: list of RDKit Mol (or None for invalid).
+            log_prob: (bs,) differentiable log-prob from the re-evaluated step.
+        """
+        dense_data, node_mask = utils.to_dense(
+            data.x, data.edge_index, data.edge_attr, data.batch)
+
+        z_T = diffusion_utils.sample_discrete_feature_noise(
+            limit_dist=self.limit_dist, node_mask=node_mask)
+        X, E, y = dense_data.X, z_T.E, data.y
+
+        bs = X.shape[0]
+
+        # Pick one random timestep to re-evaluate with gradients
+        rl_step = torch.randint(0, self.T, (1,)).item()
+
+        # Storage for the state at the chosen step
+        saved_E_t = None   # z_t at the RL step
+        saved_E_s = None   # z_s sampled at the RL step (the action we took)
+        saved_s_norm = None
+        saved_t_norm = None
+
+        # ------- Phase 1: sample full trajectory (no grad) -------
+        with torch.no_grad():
+            for s_int in reversed(range(0, self.T)):
+                s_array = s_int * torch.ones((bs, 1), dtype=torch.float32, device=self.device)
+                t_array = s_array + 1
+                s_norm = s_array / self.T
+                t_norm = t_array / self.T
+
+                if s_int == rl_step:
+                    # Save the state BEFORE this step (z_t) for replay
+                    saved_E_t = E.clone()
+                    saved_s_norm = s_norm
+                    saved_t_norm = t_norm
+
+                sampled_s, _ = self.sample_p_zs_given_zt(
+                    s_norm, t_norm, X, E, y, node_mask)
+                _, E, y = sampled_s.X, sampled_s.E, data.y
+
+                if s_int == rl_step:
+                    # Save the action we took (z_s)
+                    saved_E_s = E.clone()
+
+        # Build molecules from the final sample
+        sampled_s.X = X
+        sampled_s = sampled_s.mask(node_mask, collapse=True)
+
+        mols = []
+        for nodes, adj_mat in zip(sampled_s.X, sampled_s.E):
+            mols.append(self.visualization_tools.mol_from_graphs(nodes, adj_mat))
+
+        # ------- Phase 2: replay the chosen step WITH gradients -------
+        # Re-run the decoder at the saved timestep and compute log p(z_s | z_t)
+        # under the CURRENT parameters (this is what REINFORCE differentiates).
+        log_prob = self._replay_step_log_prob(
+            saved_s_norm, saved_t_norm, X, saved_E_t, y, node_mask, saved_E_s,
+        )
+
+        return mols, log_prob
+
+    def _replay_step_log_prob(self, s, t, X_t, E_t, y_t, node_mask, E_s_sampled):
+        """Re-evaluate one denoising step with gradients to get differentiable log p.
+
+        Args:
+            s, t: normalised timesteps (bs, 1).
+            X_t: node features at time t (bs, n, dx) — fixed ground-truth nodes.
+            E_t: edge features at time t (bs, n, n, de) — the z_t we conditioned on.
+            y_t: conditioning (bs, dy).
+            node_mask: (bs, n).
+            E_s_sampled: the edge indices (bs, n, n) that were actually sampled.
+
+        Returns:
+            log_prob: (bs,) differentiable per-example log-probability.
+        """
+        bs, n, _ = X_t.shape
+
+        beta_t = self.noise_schedule(t_normalized=t)
+        alpha_s_bar = self.noise_schedule.get_alpha_bar(t_normalized=s)
+        alpha_t_bar = self.noise_schedule.get_alpha_bar(t_normalized=t)
+
+        Qtb = self.transition_model.get_Qt_bar(alpha_t_bar, self.device)
+        Qsb = self.transition_model.get_Qt_bar(alpha_s_bar, self.device)
+        Qt = self.transition_model.get_Qt(beta_t, self.device)
+
+        # Forward pass WITH gradients
+        noisy_data = {'X_t': X_t, 'E_t': E_t, 'y_t': y_t, 't': t, 'node_mask': node_mask}
+        extra_data = self.compute_extra_data(noisy_data)
+        peak_tokens, peak_mask = self._get_peak_context()
+        pred = self.forward(noisy_data, extra_data, node_mask,
+                            peak_tokens=peak_tokens, peak_mask=peak_mask)
+
+        pred_E = F.softmax(pred.E, dim=-1)
+
+        # Compute posterior for edges: p(z_s | z_t)
+        p_s_and_t_given_0_E = diffusion_utils.compute_batched_over0_posterior_distribution(
+            X_t=E_t, Qt=Qt.E, Qsb=Qsb.E, Qtb=Qtb.E)
+
+        pred_E_flat = pred_E.reshape((bs, -1, pred_E.shape[-1]))
+        weighted_E = pred_E_flat.unsqueeze(-1) * p_s_and_t_given_0_E
+        unnormalized_prob_E = weighted_E.sum(dim=-2)
+        unnormalized_prob_E[torch.sum(unnormalized_prob_E, dim=-1) == 0] = 1e-5
+        prob_E = unnormalized_prob_E / torch.sum(unnormalized_prob_E, dim=-1, keepdim=True)
+        prob_E = prob_E.reshape(bs, n, n, -1)  # (bs, n, n, de)
+
+        # Compute log p of the edges that were actually sampled
+        # E_s_sampled is one-hot (bs, n, n, de) — convert to integer indices
+        prob_E_flat = prob_E.reshape(-1, prob_E.shape[-1]).clamp(min=1e-8)
+        E_s_idx = E_s_sampled.argmax(dim=-1)  # (bs, n, n)
+        E_s_flat = E_s_idx.reshape(-1).long()  # (bs*n*n,)
+        lp_E = torch.log(prob_E_flat.gather(1, E_s_flat.unsqueeze(1)).squeeze(1) + 1e-10)
+        lp_E = lp_E.reshape(bs, n, n)
+
+        # Only count upper-triangle (edges are symmetric)
+        upper_mask = torch.triu(torch.ones(n, n, device=lp_E.device), diagonal=1).bool()
+        upper_mask = upper_mask.unsqueeze(0).expand(bs, -1, -1)
+        edge_valid = (node_mask.unsqueeze(1) * node_mask.unsqueeze(2))
+        lp_E = lp_E * upper_mask.float() * edge_valid.float()
+
+        log_prob = lp_E.reshape(bs, -1).sum(dim=-1)  # (bs,)
+        return log_prob
 
     def sample_p_zs_given_zt(self, s, t, X_t, E_t, y_t, node_mask):
         """Samples from zs ~ p(zs | zt). Only used during sampling.

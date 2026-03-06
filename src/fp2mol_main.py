@@ -70,7 +70,7 @@ def get_resume_adaptive(cfg, model_kwargs):
 
 def load_decoder_from_lightning_ckpt(model, ckpt_path):
     """ Load a model from a PyTorch Lightning checkpoint. """
-    state_dict = torch.load(ckpt_path, map_location='cpu')["state_dict"]
+    state_dict = torch.load(ckpt_path, map_location='cpu', weights_only=False)["state_dict"]
     cleaned_state_dict = {}
     for k, v in state_dict.items():
         if k.startswith('model.'):

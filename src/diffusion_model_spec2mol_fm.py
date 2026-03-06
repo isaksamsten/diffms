@@ -58,7 +58,7 @@ class Spec2MolFlowMatching(pl.LightningModule):
 
         self.cfg = cfg
         self.name = cfg.general.name
-        self.T = cfg.model.diffusion_steps  # reused as num_sampling_steps
+        self.T = cfg.model.diffusion_steps
         self.num_sampling_steps = getattr(cfg.model, 'flow_matching_steps', 50)
         self.val_num_samples = cfg.general.val_samples_to_generate
         self.test_num_samples = cfg.general.test_samples_to_generate
@@ -73,15 +73,8 @@ class Spec2MolFlowMatching(pl.LightningModule):
 
         self.dataset_info = dataset_infos
 
-        # --- Training loss ---
-        # Flow matching loss is computed directly via compute_flow_matching_loss.
         self.lambda_train = cfg.model.lambda_train
 
-        # --- Validation / test metrics ---
-        # Flow matching has no KL / logp decomposition. We track:
-        #   - X_CE / E_CE: per-component cross-entropy (fast, every epoch)
-        #   - FM loss as a scalar (logged as val/loss)
-        #   - Sampling-based metrics: acc_at_k, tanimoto, cosine, validity
         self.val_X_CE = CrossEntropyMetric()
         self.val_E_CE = CrossEntropyMetric()
         self.val_k_acc = K_ACC_Collection(list(range(1, self.val_num_samples + 1)))
@@ -99,10 +92,8 @@ class Spec2MolFlowMatching(pl.LightningModule):
         self.extra_features = extra_features
         self.domain_features = domain_features
 
-        # --- Cross-attention feature flag ---
         self.use_cross_attention = getattr(cfg.model, 'cross_attention', False)
 
-        # --- Decoder (GraphTransformer) ---
         hidden_size = getattr(cfg.model, 'encoder_hidden_dim', 256)
         self.decoder = GraphTransformer(
             n_layers=cfg.model.n_layers,
@@ -118,7 +109,7 @@ class Spec2MolFlowMatching(pl.LightningModule):
 
         try:
             if cfg.general.decoder is not None:
-                state_dict = torch.load(cfg.general.decoder, map_location='cpu')
+                state_dict = torch.load(cfg.general.decoder, map_location='cpu', weights_only=False)
                 if 'state_dict' in state_dict:
                     state_dict = state_dict['state_dict']
                     cleaned_state_dict = {}
@@ -129,9 +120,8 @@ class Spec2MolFlowMatching(pl.LightningModule):
                     state_dict = cleaned_state_dict
                 self.decoder.load_state_dict(state_dict, strict=not self.use_cross_attention)
         except Exception as e:
-            logging.info(f"Could not load decoder: {e}")
+            raise RuntimeError(f"Failed to load pretrained decoder from '{cfg.general.decoder}': {e}")
 
-        # --- Encoder ---
         magma_modulo = getattr(cfg.model, 'encoder_magma_modulo', 512)
 
         self.encoder = SpectraEncoderGrowing(
@@ -157,11 +147,10 @@ class Spec2MolFlowMatching(pl.LightningModule):
 
         try:
             if cfg.general.encoder is not None:
-                self.encoder.load_state_dict(torch.load(cfg.general.encoder), strict=True)
+                self.encoder.load_state_dict(torch.load(cfg.general.encoder, weights_only=False), strict=True)
         except Exception as e:
-            logging.info(f"Could not load encoder: {e}")
+            raise RuntimeError(f"Failed to load pretrained encoder from '{cfg.general.encoder}': {e}")
 
-        # --- Merge layer ---
         self.denoise_nodes = getattr(cfg.dataset, 'denoise_nodes', False)
         self.merge = getattr(cfg.dataset, 'merge', 'none')
 
@@ -176,9 +165,6 @@ class Spec2MolFlowMatching(pl.LightningModule):
         elif self.merge == 'downproject_4096':
             self.merge_function = nn.Linear(4096, cfg.dataset.morgan_nbits)
 
-        # --- Prior distributions ---
-        # Flow matching uses a prior distribution instead of transition matrices.
-        # We reuse the marginal/uniform distribution from the dataset.
         if cfg.model.transition == 'marginal':
             node_types = self.dataset_info.node_types.float()
             x_marginals = node_types / torch.sum(node_types)
@@ -199,9 +185,6 @@ class Spec2MolFlowMatching(pl.LightningModule):
         self.log_every_steps = cfg.general.log_every_steps
         self.val_counter = 1
 
-    # ================================================================
-    # Merge helper (extracted to avoid duplication)
-    # ================================================================
     def _apply_merge(self, data, output, aux):
         """Apply the merge strategy to set data.y from encoder outputs.
 
@@ -216,8 +199,6 @@ class Spec2MolFlowMatching(pl.LightningModule):
         elif self.merge == 'downproject_4096':
             data.y = self.merge_function(output)
 
-        # Store peak tokens for cross-attention (always extracted; only used
-        # downstream when self.use_cross_attention is True).
         self._peak_tokens = aux.get("peak_tensor", None)   # (B, Np, hidden_size)
         self._peak_mask = aux.get("peak_mask", None)        # (B, Np), True=valid
 
@@ -229,9 +210,6 @@ class Spec2MolFlowMatching(pl.LightningModule):
             return self._peak_tokens, self._peak_mask
         return None, None
 
-    # ================================================================
-    # Forward pass (feeds into GraphTransformer with optional cross-attention)
-    # ================================================================
     def forward(self, noisy_data, extra_data, node_mask,
                 peak_tokens=None, peak_mask=None):
         X = torch.cat((noisy_data['X_t'], extra_data.X), dim=2).float()
@@ -240,9 +218,6 @@ class Spec2MolFlowMatching(pl.LightningModule):
         return self.decoder(X, E, y, node_mask,
                             peak_tokens=peak_tokens, peak_mask=peak_mask)
 
-    # ================================================================
-    # Extra features (same as original)
-    # ================================================================
     def compute_extra_data(self, noisy_data):
         """Compute extra features (cycles, eigenvalues, molecular features, timestep)."""
         extra_features = self.extra_features(noisy_data)
@@ -257,33 +232,24 @@ class Spec2MolFlowMatching(pl.LightningModule):
 
         return utils.PlaceHolder(X=extra_X, E=extra_E, y=extra_y)
 
-    # ================================================================
-    # TRAINING: Flow Matching interpolation + cross-entropy loss
-    # ================================================================
     def apply_noise_flow_matching(self, X, E, y, node_mask):
         """Sample time t and construct z_t via simplex interpolation.
-
-        Instead of the D3PM forward process (x_0 @ Q_t), we use:
-            z_t ~ Cat(t * x_0 + (1-t) * prior)
 
         Returns:
             noisy_data dict compatible with compute_extra_data / forward.
         """
         bs = X.size(0)
 
-        # Sample t ~ Uniform(0, 1) — continuous time
-        t = torch.rand(bs, 1, device=X.device)
+        eps = 1e-5
+        t = eps + (1.0 - 2 * eps) * torch.rand(bs, 1, device=X.device)
 
-        # Construct z_t for edges via interpolation + sampling
         E_t = sample_zt(E, self.prior_E, t, node_mask)
 
-        # Symmetrize edge samples
         E_t_idx = E_t.argmax(dim=-1)
         upper = torch.triu(E_t_idx, diagonal=1)
         E_t_idx = upper + upper.transpose(1, 2)
         E_t = F.one_hot(E_t_idx, num_classes=self.Edim_output).float()
 
-        # Nodes: either interpolate or keep ground truth
         if self.denoise_nodes:
             X_t = sample_zt(X, self.prior_X, t, node_mask)
         else:
@@ -314,7 +280,6 @@ class Spec2MolFlowMatching(pl.LightningModule):
         dense_data = dense_data.mask(node_mask)
         X, E = dense_data.X, dense_data.E
 
-        # Flow matching: interpolate on simplex and sample z_t
         noisy_data = self.apply_noise_flow_matching(X, E, data.y, node_mask)
 
         extra_data = self.compute_extra_data(noisy_data)
@@ -322,18 +287,13 @@ class Spec2MolFlowMatching(pl.LightningModule):
         pred = self.forward(noisy_data, extra_data, node_mask,
                             peak_tokens=peak_tokens, peak_mask=peak_mask)
 
-        # Flow matching loss: cross-entropy between predicted logits and true x_0
         loss = compute_flow_matching_loss(pred, X, E, node_mask, self.lambda_train)
 
-        # Also log the standard train metrics for monitoring
         self.train_metrics(masked_pred_X=pred.X, masked_pred_E=pred.E,
                            true_X=X, true_E=E, log=False)
 
         return {'loss': loss}
 
-    # ================================================================
-    # VALIDATION
-    # ================================================================
     def validation_step(self, batch, i):
         output, aux = self.encoder(batch)
         data = batch["graph"]
@@ -343,7 +303,6 @@ class Spec2MolFlowMatching(pl.LightningModule):
         dense_data = dense_data.mask(node_mask)
         X, E = dense_data.X, dense_data.E
 
-        # Compute flow matching loss for validation
         noisy_data = self.apply_noise_flow_matching(X, E, data.y, node_mask)
         extra_data = self.compute_extra_data(noisy_data)
         peak_tokens, peak_mask = self._get_peak_context()
@@ -352,7 +311,6 @@ class Spec2MolFlowMatching(pl.LightningModule):
 
         val_loss = compute_flow_matching_loss(pred, X, E, node_mask, self.lambda_train)
 
-        # Per-component cross-entropy for monitoring
         true_X_flat = X.reshape(-1, X.size(-1))
         pred_X_flat = pred.X.reshape(-1, pred.X.size(-1))
         mask_X = (true_X_flat != 0.).any(dim=-1)
@@ -365,7 +323,6 @@ class Spec2MolFlowMatching(pl.LightningModule):
         if mask_E.any():
             self.val_E_CE(pred_E_flat[mask_E], true_E_flat[mask_E])
 
-        # Sampling-based evaluation (periodic)
         if self.val_counter % self.cfg.general.sample_every_val == 0:
             true_mols = [Chem.inchi.MolFromInchi(data.get_example(idx).inchi) for idx in range(len(data))]
             predicted_mols = [list() for _ in range(len(data))]
@@ -380,18 +337,10 @@ class Spec2MolFlowMatching(pl.LightningModule):
 
         return {'loss': val_loss}
 
-    # ================================================================
-    # SAMPLING: Euler integration on the probability simplex
-    # ================================================================
     @torch.no_grad()
     def sample_batch(self, data: Batch):
-        """Generate molecules by integrating the flow matching ODE.
-
-        Instead of 500 reverse diffusion steps, we run ~50 Euler steps
-        on the probability simplex from prior (t=0) to data (t=1).
-        """
         dense_data, node_mask = utils.to_dense(data.x, data.edge_index, data.edge_attr, data.batch)
-        X = dense_data.X  # Ground truth nodes (kept fixed if denoise_nodes=False)
+        X = dense_data.X
         y = data.y
         bs, n, dx = X.shape
         de = self.Edim_output
@@ -399,7 +348,6 @@ class Spec2MolFlowMatching(pl.LightningModule):
 
         dt = 1.0 / self.num_sampling_steps
 
-        # Initialize edge probabilities from prior
         p_E = self.prior_E.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(bs, n, n, -1).clone()
 
         if self.denoise_nodes:
@@ -407,15 +355,12 @@ class Spec2MolFlowMatching(pl.LightningModule):
         else:
             p_X = X.clone()
 
-        # Euler integration from t=0 (prior) to t=1 (data)
-        for step in range(self.num_sampling_steps):
+        for step in range(1, self.num_sampling_steps + 1):
             t_val = step * dt
             t_tensor = torch.full((bs, 1), t_val, device=device)
 
-            # Sample current state from probability distribution
             z_t_E = sample_categorical(p_E)
 
-            # Symmetrize edges
             E_idx = z_t_E.argmax(dim=-1)
             upper = torch.triu(E_idx, diagonal=1)
             E_idx = upper + upper.transpose(1, 2)
@@ -426,7 +371,6 @@ class Spec2MolFlowMatching(pl.LightningModule):
             else:
                 z_t_X = X.clone()
 
-            # Forward pass through the model
             noisy_data = {
                 'X_t': z_t_X, 'E_t': z_t_E, 'y_t': y,
                 't': t_tensor, 'node_mask': node_mask,
@@ -436,20 +380,16 @@ class Spec2MolFlowMatching(pl.LightningModule):
             pred = self.forward(noisy_data, extra_data, node_mask,
                                 peak_tokens=peak_tokens, peak_mask=peak_mask)
 
-            # Convert logits to probabilities
             pred_E_prob = F.softmax(pred.E, dim=-1)
 
-            # Euler step on the simplex for edges
-            p_E = euler_step_simplex(p_E, pred_E_prob, t_tensor, dt, self.prior_E)
+            p_E = euler_step_simplex(p_E, pred_E_prob, t_tensor, dt)
 
             if self.denoise_nodes:
                 pred_X_prob = F.softmax(pred.X, dim=-1)
-                p_X = euler_step_simplex(p_X, pred_X_prob, t_tensor, dt, self.prior_X)
+                p_X = euler_step_simplex(p_X, pred_X_prob, t_tensor, dt)
 
-        # Final sample from the converged distribution
         final_E = sample_categorical(p_E)
 
-        # Symmetrize final edges
         E_idx = final_E.argmax(dim=-1)
         upper = torch.triu(E_idx, diagonal=1)
         E_idx = upper + upper.transpose(1, 2)
@@ -460,9 +400,8 @@ class Spec2MolFlowMatching(pl.LightningModule):
         else:
             final_X = X.clone()
 
-        # Collapse to discrete and generate molecules
         result = utils.PlaceHolder(X=final_X, E=final_E, y=torch.zeros(bs, 0).to(device))
-        result.X = X  # Always use ground-truth nodes for final output
+        result.X = X
         result = result.mask(node_mask, collapse=True)
 
         mols = []
@@ -471,9 +410,175 @@ class Spec2MolFlowMatching(pl.LightningModule):
 
         return mols
 
-    # ================================================================
-    # TEST
-    # ================================================================
+    def _sample_categorical_with_log_prob(self, probs, node_mask):
+        """Sample from categorical distributions and return per-example log-prob.
+
+        Args:
+            probs: Probability vectors. Edges: (bs, n, n, de) or Nodes: (bs, n, dx).
+            node_mask: (bs, n).
+
+        Returns:
+            onehot: One-hot samples, same shape as probs.
+            per_example_log_prob: (bs,) sum of log-probs for valid positions.
+        """
+        shape = probs.shape
+        num_classes = shape[-1]
+        bs = shape[0]
+
+        flat_probs = probs.reshape(-1, num_classes).clamp(min=1e-8)
+        flat_probs = flat_probs / flat_probs.sum(dim=-1, keepdim=True)
+
+        samples = torch.multinomial(flat_probs, num_samples=1).squeeze(-1)  # (N,)
+
+        log_probs = torch.log(
+            flat_probs.gather(1, samples.unsqueeze(1)).squeeze(1) + 1e-10
+        )  # (N,)
+
+        log_probs = log_probs.reshape(bs, -1)
+
+        if node_mask is not None:
+            if probs.dim() == 4:  # edges: (bs, n, n, de)
+                edge_mask = (node_mask.unsqueeze(1) * node_mask.unsqueeze(2)).reshape(bs, -1)
+                log_probs = log_probs * edge_mask.float()
+            elif probs.dim() == 3:  # nodes: (bs, n, dx)
+                log_probs = log_probs * node_mask.float()
+
+        per_example_log_prob = log_probs.sum(dim=-1)  # (bs,)
+        onehot = F.one_hot(samples, num_classes=num_classes).float().reshape(shape)
+        return onehot, per_example_log_prob
+
+    def sample_batch_with_log_probs(self, data: Batch):
+        """Generate molecules while tracking a differentiable log-probability.
+
+        Memory-efficient implementation: runs the full sampling loop with
+        torch.no_grad(), records state at one randomly chosen step, then
+        **re-evaluates that single step** with gradients enabled.
+
+        This gives an unbiased single-sample estimate of ∇θ log π(τ) via
+        REINFORCE, using only O(1) backward-pass memory instead of O(T).
+
+        Args:
+            data: PyG Batch (already has .y set by encoder/merge).
+
+        Returns:
+            mols: list of RDKit Mol (or None for invalid).
+            log_prob: (bs,) differentiable log-prob from the re-evaluated step.
+        """
+        dense_data, node_mask = utils.to_dense(
+            data.x, data.edge_index, data.edge_attr, data.batch
+        )
+        X = dense_data.X
+        y = data.y
+        bs, n, dx = X.shape
+        de = self.Edim_output
+        device = self.device
+        dt = 1.0 / self.num_sampling_steps
+
+        rl_step = torch.randint(1, self.num_sampling_steps + 1, (1,)).item()
+
+        saved_p_E = None
+        saved_z_t_E = None
+        saved_t_tensor = None
+
+        p_E = self.prior_E.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(bs, n, n, -1).clone()
+
+        if self.denoise_nodes:
+            p_X = self.prior_X.unsqueeze(0).unsqueeze(0).expand(bs, n, -1).clone()
+        else:
+            p_X = X.clone()
+
+        with torch.no_grad():
+            for step in range(1, self.num_sampling_steps + 1):
+                t_val = step * dt
+                t_tensor = torch.full((bs, 1), t_val, device=device)
+
+                z_t_E = sample_categorical(p_E, node_mask)
+                E_idx = z_t_E.argmax(dim=-1)
+                upper = torch.triu(E_idx, diagonal=1)
+                E_idx = upper + upper.transpose(1, 2)
+                z_t_E = F.one_hot(E_idx, num_classes=de).float()
+
+                if self.denoise_nodes:
+                    z_t_X = sample_categorical(p_X, node_mask)
+                else:
+                    z_t_X = X.clone()
+
+                if step == rl_step:
+                    saved_p_E = p_E.clone()
+                    saved_z_t_E = z_t_E.clone()
+                    saved_z_t_X = z_t_X.clone()
+                    saved_t_tensor = t_tensor.clone()
+
+                noisy_data = {
+                    'X_t': z_t_X, 'E_t': z_t_E, 'y_t': y,
+                    't': t_tensor, 'node_mask': node_mask,
+                }
+                extra_data = self.compute_extra_data(noisy_data)
+                peak_tokens, peak_mask = self._get_peak_context()
+                pred = self.forward(noisy_data, extra_data, node_mask,
+                                    peak_tokens=peak_tokens, peak_mask=peak_mask)
+
+                pred_E_prob = F.softmax(pred.E, dim=-1)
+                p_E = euler_step_simplex(p_E, pred_E_prob, t_tensor, dt)
+
+                if self.denoise_nodes:
+                    pred_X_prob = F.softmax(pred.X, dim=-1)
+                    p_X = euler_step_simplex(p_X, pred_X_prob, t_tensor, dt)
+
+            final_E = sample_categorical(p_E, node_mask)
+            E_idx = final_E.argmax(dim=-1)
+            upper = torch.triu(E_idx, diagonal=1)
+            E_idx = upper + upper.transpose(1, 2)
+            final_E = F.one_hot(E_idx, num_classes=de).float()
+
+            if self.denoise_nodes:
+                final_X = sample_categorical(p_X, node_mask)
+            else:
+                final_X = X.clone()
+
+        result = utils.PlaceHolder(X=final_X, E=final_E,
+                                   y=torch.zeros(bs, 0).to(device))
+        result.X = X
+        result = result.mask(node_mask, collapse=True)
+
+        mols = []
+        for nodes, adj_mat in zip(result.X, result.E):
+            mols.append(self.visualization_tools.mol_from_graphs(nodes, adj_mat))
+
+        noisy_data = {
+            'X_t': saved_z_t_X, 'E_t': saved_z_t_E, 'y_t': y,
+            't': saved_t_tensor, 'node_mask': node_mask,
+        }
+        extra_data = self.compute_extra_data(noisy_data)
+        peak_tokens, peak_mask = self._get_peak_context()
+        pred = self.forward(noisy_data, extra_data, node_mask,
+                            peak_tokens=peak_tokens, peak_mask=peak_mask)
+
+        pred_E_prob = F.softmax(pred.E, dim=-1)
+        p_E_next = euler_step_simplex(saved_p_E, pred_E_prob, saved_t_tensor, dt)
+
+        p_E_flat = p_E_next.reshape(-1, de).clamp(min=1e-8)
+        p_E_flat = p_E_flat / p_E_flat.sum(dim=-1, keepdim=True)
+
+        pred_E_flat = pred_E_prob.reshape(-1, de).clamp(min=1e-8)
+
+        final_E_idx = final_E.argmax(dim=-1) if final_E.dim() == 4 else final_E
+        final_E_flat = final_E_idx.reshape(-1).long()
+
+        lp_E = torch.log(
+            pred_E_flat.gather(1, final_E_flat.unsqueeze(1)).squeeze(1) + 1e-10
+        )
+        lp_E = lp_E.reshape(bs, n, n)
+
+        upper_mask = torch.triu(torch.ones(n, n, device=device), diagonal=1).bool()
+        upper_mask = upper_mask.unsqueeze(0).expand(bs, -1, -1)
+        edge_valid = (node_mask.unsqueeze(1) * node_mask.unsqueeze(2))
+        lp_E = lp_E * upper_mask.float() * edge_valid.float()
+
+        log_prob = lp_E.reshape(bs, -1).sum(dim=-1)  # (bs,)
+
+        return mols, log_prob
+
     def test_step(self, batch, i):
         output, aux = self.encoder(batch)
         data = batch["graph"]
@@ -491,7 +596,6 @@ class Spec2MolFlowMatching(pl.LightningModule):
 
         val_loss = compute_flow_matching_loss(pred, X, E, node_mask, self.lambda_train)
 
-        # Per-component cross-entropy for monitoring
         true_X_flat = X.reshape(-1, X.size(-1))
         pred_X_flat = pred.X.reshape(-1, pred.X.size(-1))
         mask_X = (true_X_flat != 0.).any(dim=-1)
@@ -523,9 +627,6 @@ class Spec2MolFlowMatching(pl.LightningModule):
 
         return {'loss': val_loss}
 
-    # ================================================================
-    # Optimizer / scheduler / lifecycle (reused from original)
-    # ================================================================
     def configure_optimizers(self):
         if self.cfg.train.scheduler == 'const':
             return torch.optim.AdamW(self.parameters(), lr=self.cfg.train.lr,

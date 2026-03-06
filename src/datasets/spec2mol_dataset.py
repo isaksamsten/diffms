@@ -37,7 +37,7 @@ class Spec2MolDataModule(MolecularDataModule):
         self.datadir = cfg.dataset.datadir
         self.filter_dataset = cfg.dataset.filter
         self.train_smiles = []
-        
+
         data_splitter = splitter.PresetSpectraSplitter(split_file=cfg.dataset.split_file)
 
         paired_featurizer = featurizers.PairedFeaturizer(
@@ -56,6 +56,17 @@ class Spec2MolDataModule(MolecularDataModule):
         random.seed(42)
         random.shuffle(test)
 
+        max_train = getattr(cfg.train, 'rl_max_train_samples', None) or None
+        max_val = getattr(cfg.train, 'rl_max_val_samples', None) or None
+        if max_train is not None:
+            max_train = int(max_train)
+            random.seed(42)
+            random.shuffle(train)
+            train = train[:max_train]
+        if max_val is not None:
+            max_val = int(max_val)
+            val = val[:max_val]
+
         ms_datasets = {'train': datasets.SpectraMolDataset(spectra_mol_list=train, featurizer=paired_featurizer, **cfg.dataset),
                     'val': datasets.SpectraMolDataset(spectra_mol_list=val, featurizer=paired_featurizer, **cfg.dataset),
                     'test': datasets.SpectraMolDataset(spectra_mol_list=test, featurizer=paired_featurizer, **cfg.dataset)}
@@ -66,10 +77,10 @@ class Spec2MolDataModule(MolecularDataModule):
 
     def val_dataloader(self) -> DataLoader:
         return get_paired_loader_graph(self.val_dataset, shuffle=False, batch_size=self.eval_batch_size, **self.kwargs)
-    
+
     def test_dataloader(self) -> DataLoader:
         return get_paired_loader_graph(self.test_dataset, shuffle=False, batch_size=self.eval_batch_size, **self.kwargs)
-    
+
     def valency_count(self, max_n_nodes):
         valencies = torch.zeros(3 * max_n_nodes - 2)   # Max valency possible if everything is connected
 
@@ -87,7 +98,7 @@ class Spec2MolDataModule(MolecularDataModule):
                 valencies[valency.long().item()] += 1
         valencies = valencies / valencies.sum()
         return valencies
-    
+
     def node_counts(self, max_nodes_possible=150):
         all_counts = torch.zeros(max_nodes_possible)
         for loader in [self.train_dataloader(), self.val_dataloader()]:
@@ -116,7 +127,7 @@ class Spec2MolDataModule(MolecularDataModule):
 
         counts = counts / counts.sum()
         return counts
-    
+
     def edge_counts(self):
         num_classes = None
         for batch in self.train_dataloader():
@@ -165,7 +176,7 @@ class Spec2MolDatasetInfos(AbstractDatasetInfos):
                           node_types=f'{self._root_path}/atom_types.txt',
                           edge_types=f'{self._root_path}/edge_types.txt',
                           valency_distribution=f'{self._root_path}/valencies.txt')
-        
+
         if cfg.dataset.stats_dir:
             meta_read = dict(n_nodes=f'{self._root_path}/n_counts.txt',
                           node_types=f'{cfg.dataset.stats_dir}/atom_types.txt',
@@ -212,7 +223,7 @@ class Spec2MolDatasetInfos(AbstractDatasetInfos):
             print("Distribution of the valencies", valencies)
             np.savetxt(meta_files["valency_distribution"], valencies.numpy())
             self.valency_distribution = valencies
-        
+
         self.complete_infos(n_nodes=self.n_nodes, node_types=self.node_types)
 
     def compute_input_output_dims(self, datamodule, extra_features, domain_features):

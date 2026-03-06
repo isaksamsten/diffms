@@ -1,0 +1,75 @@
+# Inherits all keys from train_default.yaml; override what differs.
+
+n_epochs: 5
+batch_size: 16
+eval_batch_size: 16
+lr: 0.0002
+clip_grad: 1.0
+save_model: True
+num_workers: 1
+pin_memory: True
+ema_decay: 0
+progress_bar: false
+weight_decay: 1e-12
+optimizer: adamw
+scheduler: 'const'
+pct_start: 0.3
+seed: 123
+
+rl_finetuning: true
+
+# RL algorithm: 'reinforce' | 'grpo'
+rl_algorithm: 'reinforce'
+
+# Reward function: 'validity' | 'qed' | 'sa' | 'logp' | 'mw' | 'tanimoto' | 'composite'
+rl_reward: 'validity'
+
+# Weights for composite reward (order: validity, qed, sa)
+rl_reward_weights: [0.3, 0.5, 0.2]
+
+# Target SMILES for tanimoto reward
+rl_reward_target_smiles: null
+
+# Learning rate for RL
+rl_lr: 0.00002
+
+# Scheduler for RL optimiser: 'const' | 'one_cycle'
+rl_scheduler: 'const'
+
+# Weight of the supervised FM loss (KL regularisation).
+# Higher = more conservative (stays closer to pretrained).
+# Lower  = more aggressive (follows reward signal more).
+rl_kl_coeff: 0.1
+
+# Weight of the policy gradient loss
+rl_pg_coeff: 1.0
+
+# Number of molecules sampled per input spectrum for variance reduction.
+# More samples = lower variance but higher cost per step.
+rl_num_samples: 4
+
+# EMA momentum for running reward baseline (variance reduction).
+# Higher = smoother baseline, slower adaptation.
+rl_baseline_momentum: 0.99
+
+# Override sampling steps during RL training (0 = use model default).
+# Fewer steps = faster but noisier sampling.
+rl_sampling_steps: 0
+
+# Path to pretrained FM checkpoint to load
+rl_pretrained_checkpoint: null
+
+# Freeze encoder during RL (should almost always be true)
+rl_freeze_encoder: true
+
+rl_max_train_samples: null
+rl_max_val_samples: null
+
+
+# PPO-style clipping epsilon. Smaller = more conservative updates.
+grpo_clip_eps: 0.2
+
+# Weight of the approximate KL penalty between current and sampling-time
+# policy.
+grpo_kl_coeff: 0.01
+

@@ -6,6 +6,17 @@ import logging
 
 import torch
 torch.cuda.empty_cache()
+
+# PyTorch >= 2.6 defaults weights_only=True in torch.load, but
+# pytorch_lightning 2.0.4 doesn't pass weights_only=False when loading
+# checkpoints. Monkey-patch torch.load so the default is False.
+_orig_torch_load = torch.load
+def _patched_torch_load(*args, **kwargs):
+    if "weights_only" not in kwargs:
+        kwargs["weights_only"] = False
+    return _orig_torch_load(*args, **kwargs)
+torch.load = _patched_torch_load
+
 try:
     torch.set_float32_matmul_precision('medium')
     logging.info("Enabled float32 matmul precision - medium")
@@ -66,7 +77,7 @@ def get_resume_adaptive(cfg, model_kwargs):
     model_type = getattr(cfg.model, 'model_type', 'diffusion')
     model_cls = Spec2MolFlowMatching if model_type == 'flow_matching' else Spec2MolDenoisingDiffusion
     model = model_cls.load_from_checkpoint(resume_path, **model_kwargs)
-    
+
     new_cfg = model.cfg
 
     for category in cfg:
@@ -79,7 +90,7 @@ def get_resume_adaptive(cfg, model_kwargs):
     new_cfg = utils.update_config_with_new_keys(new_cfg, saved_cfg)
     return new_cfg, model
 
-def apply_encoder_finetuning(model, strategy):    
+def apply_encoder_finetuning(model, strategy):
     if strategy is None:
         pass
     elif strategy == 'freeze':
@@ -107,7 +118,7 @@ def apply_encoder_finetuning(model, strategy):
                 param[1].requires_grad = False
     else:
         raise NotImplementedError(f'Unknown Finetune Strategy: {strategy}')
-    
+
 def apply_decoder_finetuning(model, strategy):
     if strategy is None:
         pass
@@ -143,27 +154,27 @@ def apply_decoder_finetuning(model, strategy):
 def load_weights(model, path):
     """
     Loads only the weights from a checkpoint file into the model without loading the full Lightning module.
-    
+
     Args:
         model: The model to load weights into
         path: Path to the checkpoint file
-        
+
     Returns:
         The model with loaded weights
     """
-    checkpoint = torch.load(path, map_location='cpu')
+    checkpoint = torch.load(path, map_location='cpu', weights_only=False)
     state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
-    
+
     # Filter out keys that don't match the model (for partial loading)
     model_state_dict = model.state_dict()
     filtered_state_dict = {k: v for k, v in state_dict.items() if k in model_state_dict}
-    
+
     # Load the weights
     missing_keys, unexpected_keys = model.load_state_dict(filtered_state_dict, strict=False)
     logging.info(f"Loaded weights from {path}")
     logging.info(f"Missing keys: {missing_keys}")
     logging.info(f"Unexpected keys: {unexpected_keys}")
-    
+
     return model
 
 @hydra.main(version_base='1.3', config_path='../configs', config_name='config')
@@ -240,9 +251,10 @@ def main(cfg: DictConfig):
     callbacks = []
     callbacks.append(LearningRateMonitor(logging_interval='step'))
     if cfg.train.save_model: # TODO: More advanced checkpointing
+        monitor_metric = 'val/E_CE' if cfg.model.model_type == 'flow_matching' else 'val/NLL'
         checkpoint_callback = ModelCheckpoint(dirpath=f"checkpoints/{cfg.general.name}", # best (top-5) checkpoints
                                               filename='{epoch}',
-                                              monitor='val/NLL',
+                                              monitor=monitor_metric,
                                               save_top_k=5,
                                               mode='min',
                                               every_n_epochs=1)
