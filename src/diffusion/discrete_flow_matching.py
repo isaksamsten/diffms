@@ -195,8 +195,8 @@ def sample_discrete_flow_matching(
 
     p_E = prior_E.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(bs, n, n, -1).to(device)
 
-    for step in range(1, num_steps + 1):
-        t = step * dt
+    for step in range(num_steps):
+        t = step * dt                   # current time: 0, dt, 2*dt, ..., 1-dt
         t_tensor = torch.full((bs, 1), t, device=device)
 
         z_t_E = sample_categorical(p_E)

@@ -355,8 +355,8 @@ class Spec2MolFlowMatching(pl.LightningModule):
         else:
             p_X = X.clone()
 
-        for step in range(1, self.num_sampling_steps + 1):
-            t_val = step * dt
+        for step in range(self.num_sampling_steps):
+            t_val = step * dt               # current time: 0, dt, 2*dt, ..., 1-dt
             t_tensor = torch.full((bs, 1), t_val, device=device)
 
             z_t_E = sample_categorical(p_E)
