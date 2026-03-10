@@ -362,6 +362,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         self.test_CE.reset()
 
     def test_step(self, batch, i):
+        t0 = time.time()
         output, aux = self.encoder(batch)
 
         data = batch["graph"]
@@ -389,12 +390,14 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
 
         self.test_CE(flat_pred_E, flat_true_E)
 
-        true_mols = [Chem.inchi.MolFromInchi(data.get_example(idx).inchi) for idx in range(len(data))] # Is this correct?
+        true_mols = [Chem.inchi.MolFromInchi(data.get_example(idx).inchi) for idx in range(len(data))]
         predicted_mols = [list() for _ in range(len(data))]
 
-        for _ in range(self.test_num_samples):
+        for s in range(self.test_num_samples):
             for idx, mol in enumerate(self.sample_batch(data)):
                 predicted_mols[idx].append(mol)
+            if self.global_rank == 0 and (s + 1) % 10 == 0:
+                logging.info(f"  test batch {i}: sample {s + 1}/{self.test_num_samples}")
 
         with open(f"preds/{self.name}_rank_{self.global_rank}_pred_{i}.pkl", "wb") as f:
             pickle.dump(predicted_mols, f)
@@ -405,6 +408,13 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             self.test_k_acc.update(predicted_mols[idx], true_mols[idx])
             self.test_sim_metrics.update(predicted_mols[idx], true_mols[idx])
             self.test_validity.update(predicted_mols[idx])
+
+        if self.global_rank == 0:
+            elapsed = time.time() - t0
+            acc_1 = self.test_k_acc.metrics['acc_at_1'].correct.item() / max(self.test_k_acc.metrics['acc_at_1'].total.item(), 1)
+            val = self.test_validity.valid.item() / max(self.test_validity.total.item(), 1)
+            logging.info(f"Test batch {i} done in {elapsed:.1f}s | "
+                         f"running acc@1={acc_1:.4f}, validity={val:.4f}")
 
         return {'loss': nll}
 
@@ -800,22 +810,27 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         out_one_hot = utils.PlaceHolder(X=X_s, E=E_s, y=torch.zeros(y_t.shape[0], 0))
         return out_one_hot.mask(node_mask).type_as(y_t), log_prob
 
-    def sample_batch_with_log_probs(self, data: Batch):
+    def sample_batch_with_log_probs(self, data: Batch, replay_steps: int = 1,
+                                     return_replay_state: bool = False):
         """Generate molecules while tracking a differentiable log-probability.
 
         Memory-efficient implementation: runs the full T-step reverse sampling
         with torch.no_grad(), records the sampled z_t at each step, then
-        **re-evaluates a single randomly chosen step** with gradients enabled.
-
-        This gives an unbiased single-sample estimate of ∇θ log π(τ) via
-        REINFORCE, using only O(1) backward-pass memory instead of O(T).
+        re-evaluates K randomly chosen steps with gradients enabled and
+        sums their log-probs.
 
         Args:
             data: PyG Batch (already has .y set by encoder/merge).
+            replay_steps: Number of denoising steps to replay with gradients.
+            return_replay_state: If True, also return the internal replay
+                state so that :meth:`replay_log_probs` can re-evaluate the
+                same steps under updated parameters (needed for GRPO).
 
         Returns:
             mols: list of RDKit Mol (or None for invalid).
-            log_prob: (bs,) differentiable log-prob from the re-evaluated step.
+            log_prob: (bs,) differentiable log-prob (sum over replayed steps).
+            replay_state: (only if *return_replay_state*) opaque dict that
+                can be passed to :meth:`replay_log_probs`.
         """
         dense_data, node_mask = utils.to_dense(
             data.x, data.edge_index, data.edge_attr, data.batch)
@@ -826,16 +841,12 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
 
         bs = X.shape[0]
 
-        # Pick one random timestep to re-evaluate with gradients
-        rl_step = torch.randint(0, self.T, (1,)).item()
+        K = min(replay_steps, self.T)
+        rl_steps = set(torch.randperm(self.T)[:K].tolist())
 
-        # Storage for the state at the chosen step
-        saved_E_t = None   # z_t at the RL step
-        saved_E_s = None   # z_s sampled at the RL step (the action we took)
-        saved_s_norm = None
-        saved_t_norm = None
+        # Storage: one entry per replayed step
+        saved = {}  # s_int -> (E_t, E_s, s_norm, t_norm)
 
-        # ------- Phase 1: sample full trajectory (no grad) -------
         with torch.no_grad():
             for s_int in reversed(range(0, self.T)):
                 s_array = s_int * torch.ones((bs, 1), dtype=torch.float32, device=self.device)
@@ -843,19 +854,17 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                 s_norm = s_array / self.T
                 t_norm = t_array / self.T
 
-                if s_int == rl_step:
+                if s_int in rl_steps:
                     # Save the state BEFORE this step (z_t) for replay
                     saved_E_t = E.clone()
-                    saved_s_norm = s_norm
-                    saved_t_norm = t_norm
 
                 sampled_s, _ = self.sample_p_zs_given_zt(
                     s_norm, t_norm, X, E, y, node_mask)
                 _, E, y = sampled_s.X, sampled_s.E, data.y
 
-                if s_int == rl_step:
+                if s_int in rl_steps:
                     # Save the action we took (z_s)
-                    saved_E_s = E.clone()
+                    saved[s_int] = (saved_E_t, E.clone(), s_norm, t_norm)
 
         # Build molecules from the final sample
         sampled_s.X = X
@@ -865,14 +874,51 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         for nodes, adj_mat in zip(sampled_s.X, sampled_s.E):
             mols.append(self.visualization_tools.mol_from_graphs(nodes, adj_mat))
 
-        # ------- Phase 2: replay the chosen step WITH gradients -------
-        # Re-run the decoder at the saved timestep and compute log p(z_s | z_t)
-        # under the CURRENT parameters (this is what REINFORCE differentiates).
-        log_prob = self._replay_step_log_prob(
-            saved_s_norm, saved_t_norm, X, saved_E_t, y, node_mask, saved_E_s,
+        log_prob = self._sum_replay_log_probs(saved, X, data.y, node_mask)
+
+        if return_replay_state:
+            replay_state = dict(saved=saved, X=X, y=data.y, node_mask=node_mask)
+            return mols, log_prob, replay_state
+        return mols, log_prob
+
+    def replay_log_probs(self, replay_state: dict):
+        """Re-evaluate log-probs for a previously sampled trajectory.
+
+
+        Args:
+            replay_state: The opaque dict returned by
+                :meth:`sample_batch_with_log_probs` when called with
+                ``return_replay_state=True``.
+
+        Returns:
+            log_prob: (bs,) differentiable log-prob (sum over replayed steps).
+        """
+        return self._sum_replay_log_probs(
+            replay_state['saved'],
+            replay_state['X'],
+            replay_state['y'],
+            replay_state['node_mask'],
         )
 
-        return mols, log_prob
+    def _sum_replay_log_probs(self, saved, X, y, node_mask):
+        """Sum differentiable log-probs over all saved replay steps.
+
+        Uses gradient checkpointing so that only one replay step's
+        computation graph is materialised at a time during backward,
+        keeping peak memory proportional to a single decoder forward pass
+        regardless of how many steps are replayed.
+        """
+        bs = X.shape[0]
+        log_prob = torch.zeros(bs, device=self.device)
+        for s_int in sorted(saved.keys()):
+            E_t, E_s, s_norm, t_norm = saved[s_int]
+            lp = torch.utils.checkpoint.checkpoint(
+                self._replay_step_log_prob,
+                s_norm, t_norm, X, E_t, y, node_mask, E_s,
+                use_reentrant=False,
+            )
+            log_prob = log_prob + lp
+        return log_prob
 
     def _replay_step_log_prob(self, s, t, X_t, E_t, y_t, node_mask, E_s_sampled):
         """Re-evaluate one denoising step with gradients to get differentiable log p.

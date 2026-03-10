@@ -56,6 +56,10 @@ rl_baseline_momentum: 0.99
 # Fewer steps = faster but noisier sampling.
 rl_sampling_steps: 0
 
+# Number of denoising steps to replay with gradients for the log-prob
+# estimate.  More steps = lower variance but higher memory / compute.
+rl_replay_steps: 4
+
 # Path to pretrained FM checkpoint to load
 rl_pretrained_checkpoint: null
 
@@ -72,4 +76,8 @@ grpo_clip_eps: 0.2
 # Weight of the approximate KL penalty between current and sampling-time
 # policy.
 grpo_kl_coeff: 0.01
+
+# Number of gradient updates per batch of sampled trajectories.
+# >1 allows parameters to drift from pi_old, making clipping meaningful.
+grpo_inner_steps: 4
 

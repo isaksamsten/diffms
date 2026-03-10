@@ -86,6 +86,14 @@ class Spec2MolRLFinetuning(pl.LightningModule):
         if self.rl_sampling_steps > 0 and self.model_type == 'flow_matching':
             self.model.num_sampling_steps = self.rl_sampling_steps
 
+        self.rl_replay_steps = int(getattr(cfg.train, 'rl_replay_steps', 1))
+        self.grpo_inner_steps = int(getattr(cfg.train, 'grpo_inner_steps', 4))
+
+        # GRPO requires manual optimisation so we can do multiple inner updates
+        # on the same batch of sampled trajectories.
+        if self.rl_algorithm == 'grpo':
+            self.automatic_optimization = False
+
         for p in self.model.encoder.parameters():
             p.requires_grad = False
 
@@ -128,48 +136,117 @@ class Spec2MolRLFinetuning(pl.LightningModule):
         dense_data = dense_data.mask(node_mask)
         X, E = dense_data.X, dense_data.E
 
+        use_grpo = self.rl_algorithm == 'grpo'
+
+        # --- Sample trajectories (shared by both algorithms) ---
         all_rewards = []
         all_log_probs = []
+        all_replay_states = []
 
         for _ in range(self.num_samples):
-            mols, log_probs = self.model.sample_batch_with_log_probs(data)
+            if use_grpo:
+                # For GRPO we only need the replay state and mols from
+                # sampling.  Skip the costly Phase 2 replay here — we'll
+                # compute log_probs_old via a no-grad replay below, and
+                # log_probs_new inside the inner loop.
+                with torch.no_grad():
+                    mols, _, replay_state = self.model.sample_batch_with_log_probs(
+                        data, replay_steps=self.rl_replay_steps,
+                        return_replay_state=True,
+                    )
+                all_replay_states.append(replay_state)
+            else:
+                mols, log_probs = self.model.sample_batch_with_log_probs(
+                    data, replay_steps=self.rl_replay_steps,
+                )
+                all_log_probs.append(log_probs)
+
             rewards = torch.tensor(
                 [self.reward_fn(mol) for mol in mols],
                 device=self.device, dtype=torch.float32,
             )
             all_rewards.append(rewards)
-            all_log_probs.append(log_probs)
 
         rewards = torch.stack(all_rewards, dim=1)      # (bs, G)
-        log_probs = torch.stack(all_log_probs, dim=1)   # (bs, G)
         mean_reward = rewards.mean()
+        bs = X.size(0)
 
-        if self.rl_algorithm == 'grpo':
-            pg_loss, algo_metrics = self._grpo_loss(rewards, log_probs)
+        if use_grpo:
+            # --- GRPO with manual optimisation and inner steps ---
+            opt = self.optimizers()
+
+            # Compute log_probs_old under the current (pre-update) params,
+            # without building a computation graph.
+            with torch.no_grad():
+                log_probs_old = torch.stack(
+                    [self.model.replay_log_probs(s) for s in all_replay_states],
+                    dim=1,
+                )  # (bs, G)
+
+            for inner_step in range(self.grpo_inner_steps):
+                # Re-evaluate log-probs under the CURRENT (updated) params
+                log_probs_new = torch.stack(
+                    [self.model.replay_log_probs(s) for s in all_replay_states],
+                    dim=1,
+                )  # (bs, G)
+
+                pg_loss, algo_metrics = self._grpo_loss(
+                    rewards, log_probs_new, log_probs_old,
+                )
+
+                sup_loss = _compute_supervised_loss(
+                    self.model, X, E, data.y, node_mask, self.model_type,
+                )
+
+                loss = self.pg_coeff * pg_loss + self.kl_coeff * sup_loss
+
+                opt.zero_grad()
+                self.manual_backward(loss)
+                if self.cfg.train.clip_grad:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.parameters(), self.cfg.train.clip_grad,
+                    )
+                opt.step()
+
+            # Log metrics from the LAST inner step
+            validity = (rewards > 0).float().mean()
+            log_dict = {
+                'rl_train/loss': loss,
+                'rl_train/pg_loss': pg_loss,
+                'rl_train/sup_loss': sup_loss,
+                'rl_train/mean_reward': mean_reward,
+                'rl_train/reward_std': rewards.std(),
+                'rl_train/approx_validity': validity,
+            }
+            log_dict.update(algo_metrics)
+            self.log_dict(log_dict, prog_bar=True, sync_dist=True, batch_size=bs)
+            # Manual opt → return None so Lightning doesn't try a backward pass
+            return None
+
         else:
+            # --- REINFORCE with automatic optimisation ---
+            log_probs = torch.stack(all_log_probs, dim=1)   # (bs, G)
             pg_loss, algo_metrics = self._reinforce_loss(rewards, log_probs, mean_reward)
 
-        sup_loss = _compute_supervised_loss(
-            self.model, X, E, data.y, node_mask, self.model_type,
-        )
+            sup_loss = _compute_supervised_loss(
+                self.model, X, E, data.y, node_mask, self.model_type,
+            )
 
-        loss = self.pg_coeff * pg_loss + self.kl_coeff * sup_loss
+            loss = self.pg_coeff * pg_loss + self.kl_coeff * sup_loss
 
-        bs = X.size(0)
-        validity = (rewards > 0).float().mean()  # rough proxy
+            validity = (rewards > 0).float().mean()
+            log_dict = {
+                'rl_train/loss': loss,
+                'rl_train/pg_loss': pg_loss,
+                'rl_train/sup_loss': sup_loss,
+                'rl_train/mean_reward': mean_reward,
+                'rl_train/reward_std': rewards.std(),
+                'rl_train/approx_validity': validity,
+            }
+            log_dict.update(algo_metrics)
+            self.log_dict(log_dict, prog_bar=True, sync_dist=True, batch_size=bs)
 
-        log_dict = {
-            'rl_train/loss': loss,
-            'rl_train/pg_loss': pg_loss,
-            'rl_train/sup_loss': sup_loss,
-            'rl_train/mean_reward': mean_reward,
-            'rl_train/reward_std': rewards.std(),
-            'rl_train/approx_validity': validity,
-        }
-        log_dict.update(algo_metrics)
-        self.log_dict(log_dict, prog_bar=True, sync_dist=True, batch_size=bs)
-
-        return loss
+            return loss
 
     def _reinforce_loss(self, rewards, log_probs, mean_reward):
         """Standard REINFORCE with EMA running baseline.
@@ -194,15 +271,16 @@ class Spec2MolRLFinetuning(pl.LightningModule):
 
         return pg_loss, {'rl_train/baseline': self.reward_baseline}
 
-    def _grpo_loss(self, rewards, log_probs):
+    def _grpo_loss(self, rewards, log_probs, log_probs_old):
         """Group Relative Policy Optimisation.
 
         An explicit KL penalty between the current and sampling-time
         policy is added (approximated from the ratio).
 
         Args:
-            rewards:   (bs, G)  scalar rewards per sample.
-            log_probs: (bs, G)  differentiable log-probs from replayed step.
+            rewards:       (bs, G)  scalar rewards per sample.
+            log_probs:     (bs, G)  differentiable log-probs under pi_θ (current).
+            log_probs_old: (bs, G)  detached log-probs under pi_θ_old (sampling-time).
 
         Returns:
             pg_loss:  scalar.
@@ -215,7 +293,6 @@ class Spec2MolRLFinetuning(pl.LightningModule):
         group_std = rewards.std(dim=1, keepdim=True)     # (bs, 1)
         advantages = (rewards - group_mean) / (group_std + 1e-8)  # (bs, G)
 
-        log_probs_old = log_probs.detach()
         log_ratio = log_probs - log_probs_old             # (bs, G)
         ratio = torch.exp(log_ratio)                       # (bs, G)
 
@@ -314,6 +391,7 @@ class Spec2MolRLFinetuning(pl.LightningModule):
         return {'loss': val_loss}
 
     def test_step(self, batch, i):
+        t0 = time.time()
         with torch.no_grad():
             output, aux = self.model.encoder(batch)
         data = batch["graph"]
@@ -346,11 +424,13 @@ class Spec2MolRLFinetuning(pl.LightningModule):
         predicted_mols = [list() for _ in range(len(data))]
         batch_rewards = []
 
-        for _ in range(self.test_num_samples):
+        for s in range(self.test_num_samples):
             sample_mols = self.model.sample_batch(data)
             for idx, mol in enumerate(sample_mols):
                 predicted_mols[idx].append(mol)
                 batch_rewards.append(self.reward_fn(mol))
+            if self.global_rank == 0 and (s + 1) % 10 == 0:
+                logger.info(f"  test batch {i}: sample {s + 1}/{self.test_num_samples}")
 
         with open(f"preds/{self.name}_rank_{self.global_rank}_pred_{i}.pkl", "wb") as f:
             pickle.dump(predicted_mols, f)
@@ -361,6 +441,13 @@ class Spec2MolRLFinetuning(pl.LightningModule):
             self.test_k_acc.update(predicted_mols[idx], true_mols[idx])
             self.test_sim_metrics.update(predicted_mols[idx], true_mols[idx])
             self.test_validity.update(predicted_mols[idx])
+
+        if self.global_rank == 0:
+            elapsed = time.time() - t0
+            acc_1 = self.test_k_acc.metrics['acc_at_1'].correct.item() / max(self.test_k_acc.metrics['acc_at_1'].total.item(), 1)
+            val = self.test_validity.valid.item() / max(self.test_validity.total.item(), 1)
+            logger.info(f"Test batch {i} done in {elapsed:.1f}s | "
+                        f"running acc@1={acc_1:.4f}, validity={val:.4f}")
 
         return {'loss': val_loss}
 
@@ -402,10 +489,12 @@ class Spec2MolRLFinetuning(pl.LightningModule):
             logger.info(f"[RL Finetuning] reward={self.reward_fn}")
             logger.info(f"[RL Finetuning] kl_coeff={self.kl_coeff}, "
                         f"num_samples={self.num_samples}, "
-                        f"pg_coeff={self.pg_coeff}")
+                        f"pg_coeff={self.pg_coeff}, "
+                        f"replay_steps={self.rl_replay_steps}")
             if self.rl_algorithm == 'grpo':
                 logger.info(f"[RL Finetuning] GRPO clip_eps={self.grpo_clip_eps}, "
-                            f"kl_coeff={self.grpo_kl_coeff}")
+                            f"kl_coeff={self.grpo_kl_coeff}, "
+                            f"inner_steps={self.grpo_inner_steps}")
             n_trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
             n_total = sum(p.numel() for p in self.parameters())
             logger.info(f"[RL Finetuning] Trainable params: {n_trainable:,} / {n_total:,}")

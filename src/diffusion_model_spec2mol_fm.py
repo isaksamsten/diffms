@@ -447,22 +447,28 @@ class Spec2MolFlowMatching(pl.LightningModule):
         onehot = F.one_hot(samples, num_classes=num_classes).float().reshape(shape)
         return onehot, per_example_log_prob
 
-    def sample_batch_with_log_probs(self, data: Batch):
+    def sample_batch_with_log_probs(self, data: Batch, replay_steps: int = 1,
+                                     return_replay_state: bool = False):
         """Generate molecules while tracking a differentiable log-probability.
 
         Memory-efficient implementation: runs the full sampling loop with
-        torch.no_grad(), records state at one randomly chosen step, then
-        **re-evaluates that single step** with gradients enabled.
+        torch.no_grad(), records state at K randomly chosen steps, then
+        re-evaluates those steps with gradients enabled and sums their
+        log-probs.
 
-        This gives an unbiased single-sample estimate of ∇θ log π(τ) via
-        REINFORCE, using only O(1) backward-pass memory instead of O(T).
 
         Args:
             data: PyG Batch (already has .y set by encoder/merge).
+            replay_steps: Number of Euler steps to replay with gradients.
+            return_replay_state: If True, also return the internal replay
+                state so that :meth:`replay_log_probs` can re-evaluate the
+                same steps under updated parameters (needed for GRPO).
 
         Returns:
             mols: list of RDKit Mol (or None for invalid).
-            log_prob: (bs,) differentiable log-prob from the re-evaluated step.
+            log_prob: (bs,) differentiable log-prob (sum over replayed steps).
+            replay_state: (only if *return_replay_state*) opaque dict that
+                can be passed to :meth:`replay_log_probs`.
         """
         dense_data, node_mask = utils.to_dense(
             data.x, data.edge_index, data.edge_attr, data.batch
@@ -474,11 +480,12 @@ class Spec2MolFlowMatching(pl.LightningModule):
         device = self.device
         dt = 1.0 / self.num_sampling_steps
 
-        rl_step = torch.randint(1, self.num_sampling_steps + 1, (1,)).item()
+        # Pick K random steps (0-indexed) to replay
+        K = min(replay_steps, self.num_sampling_steps)
+        rl_steps = set(torch.randperm(self.num_sampling_steps)[:K].tolist())
 
-        saved_p_E = None
-        saved_z_t_E = None
-        saved_t_tensor = None
+        # Storage: step -> (p_E_before, z_t_E, z_t_X, t_tensor, sampled_E_after)
+        saved = {}
 
         p_E = self.prior_E.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(bs, n, n, -1).clone()
 
@@ -488,8 +495,8 @@ class Spec2MolFlowMatching(pl.LightningModule):
             p_X = X.clone()
 
         with torch.no_grad():
-            for step in range(1, self.num_sampling_steps + 1):
-                t_val = step * dt
+            for step in range(self.num_sampling_steps):
+                t_val = step * dt               # current time: 0, dt, 2*dt, ..., 1-dt
                 t_tensor = torch.full((bs, 1), t_val, device=device)
 
                 z_t_E = sample_categorical(p_E, node_mask)
@@ -503,7 +510,8 @@ class Spec2MolFlowMatching(pl.LightningModule):
                 else:
                     z_t_X = X.clone()
 
-                if step == rl_step:
+                if step in rl_steps:
+                    # Save state BEFORE the network forward pass
                     saved_p_E = p_E.clone()
                     saved_z_t_E = z_t_E.clone()
                     saved_z_t_X = z_t_X.clone()
@@ -525,6 +533,18 @@ class Spec2MolFlowMatching(pl.LightningModule):
                     pred_X_prob = F.softmax(pred.X, dim=-1)
                     p_X = euler_step_simplex(p_X, pred_X_prob, t_tensor, dt)
 
+                if step in rl_steps:
+                    # Save the categorical sample drawn from p_E after the
+                    # Euler update — this is the action taken at this step.
+                    sampled_E = sample_categorical(p_E, node_mask)
+                    _idx = sampled_E.argmax(dim=-1)
+                    _upper = torch.triu(_idx, diagonal=1)
+                    _idx = _upper + _upper.transpose(1, 2)
+                    sampled_E = F.one_hot(_idx, num_classes=de).float()
+
+                    saved[step] = (saved_p_E, saved_z_t_E, saved_z_t_X,
+                                   saved_t_tensor, sampled_E)
+
             final_E = sample_categorical(p_E, node_mask)
             E_idx = final_E.argmax(dim=-1)
             upper = torch.triu(E_idx, diagonal=1)
@@ -545,9 +565,80 @@ class Spec2MolFlowMatching(pl.LightningModule):
         for nodes, adj_mat in zip(result.X, result.E):
             mols.append(self.visualization_tools.mol_from_graphs(nodes, adj_mat))
 
+        # ------- Phase 2: replay the chosen steps WITH gradients -------
+        log_prob = self._sum_replay_log_probs(saved, y, node_mask, n, de)
+
+        if return_replay_state:
+            replay_state = dict(saved=saved, y=y, node_mask=node_mask, n=n, de=de)
+            return mols, log_prob, replay_state
+        return mols, log_prob
+
+    def replay_log_probs(self, replay_state: dict):
+        """Re-evaluate log-probs for a previously sampled trajectory.
+
+        This runs Phase 2 (the replay) under the **current** model parameters
+        and returns fresh differentiable log-probs.  Used by GRPO to obtain
+        ``log π_θ`` after the parameters have diverged from the sampling-time
+        snapshot ``log π_θ_old``.
+
+        Args:
+            replay_state: The opaque dict returned by
+                :meth:`sample_batch_with_log_probs` when called with
+                ``return_replay_state=True``.
+
+        Returns:
+            log_prob: (bs,) differentiable log-prob (sum over replayed steps).
+        """
+        return self._sum_replay_log_probs(
+            replay_state['saved'],
+            replay_state['y'],
+            replay_state['node_mask'],
+            replay_state['n'],
+            replay_state['de'],
+        )
+
+    def _sum_replay_log_probs(self, saved, y, node_mask, n, de):
+        """Sum differentiable log-probs over all saved replay steps.
+
+        Uses gradient checkpointing so that only one replay step's
+        computation graph is materialised at a time during backward,
+        keeping peak memory proportional to a single decoder forward pass
+        regardless of how many steps are replayed.
+        """
+        bs = node_mask.shape[0]
+        device = node_mask.device
+
+        log_prob = torch.zeros(bs, device=device)
+
+        upper_mask = torch.triu(torch.ones(n, n, device=device), diagonal=1).bool()
+        upper_mask = upper_mask.unsqueeze(0).expand(bs, -1, -1)
+        edge_valid = (node_mask.unsqueeze(1) * node_mask.unsqueeze(2))
+
+        for step in sorted(saved.keys()):
+            s_p_E, s_z_t_E, s_z_t_X, s_t_tensor, s_sampled_E = saved[step]
+
+            lp = torch.utils.checkpoint.checkpoint(
+                self._replay_one_step_log_prob,
+                s_p_E, s_z_t_E, s_z_t_X, s_t_tensor, s_sampled_E,
+                y, node_mask, upper_mask, edge_valid,
+                use_reentrant=False,
+            )
+            log_prob = log_prob + lp
+
+        return log_prob
+
+    def _replay_one_step_log_prob(self, s_p_E, s_z_t_E, s_z_t_X, s_t_tensor,
+                                   s_sampled_E, y, node_mask, upper_mask,
+                                   edge_valid):
+        """Compute log-prob for one FM replay step (checkpointable)."""
+        de = s_p_E.shape[-1]
+        bs = node_mask.shape[0]
+        n = node_mask.shape[1]
+        dt = 1.0 / self.num_sampling_steps
+
         noisy_data = {
-            'X_t': saved_z_t_X, 'E_t': saved_z_t_E, 'y_t': y,
-            't': saved_t_tensor, 'node_mask': node_mask,
+            'X_t': s_z_t_X, 'E_t': s_z_t_E, 'y_t': y,
+            't': s_t_tensor, 'node_mask': node_mask,
         }
         extra_data = self.compute_extra_data(noisy_data)
         peak_tokens, peak_mask = self._get_peak_context()
@@ -555,31 +646,25 @@ class Spec2MolFlowMatching(pl.LightningModule):
                             peak_tokens=peak_tokens, peak_mask=peak_mask)
 
         pred_E_prob = F.softmax(pred.E, dim=-1)
-        p_E_next = euler_step_simplex(saved_p_E, pred_E_prob, saved_t_tensor, dt)
+        p_E_next = euler_step_simplex(s_p_E, pred_E_prob, s_t_tensor, dt)
 
         p_E_flat = p_E_next.reshape(-1, de).clamp(min=1e-8)
         p_E_flat = p_E_flat / p_E_flat.sum(dim=-1, keepdim=True)
 
-        pred_E_flat = pred_E_prob.reshape(-1, de).clamp(min=1e-8)
-
-        final_E_idx = final_E.argmax(dim=-1) if final_E.dim() == 4 else final_E
-        final_E_flat = final_E_idx.reshape(-1).long()
+        sampled_E_idx = s_sampled_E.argmax(dim=-1)
+        sampled_E_flat = sampled_E_idx.reshape(-1).long()
 
         lp_E = torch.log(
-            pred_E_flat.gather(1, final_E_flat.unsqueeze(1)).squeeze(1) + 1e-10
+            p_E_flat.gather(1, sampled_E_flat.unsqueeze(1)).squeeze(1) + 1e-10
         )
         lp_E = lp_E.reshape(bs, n, n)
 
-        upper_mask = torch.triu(torch.ones(n, n, device=device), diagonal=1).bool()
-        upper_mask = upper_mask.unsqueeze(0).expand(bs, -1, -1)
-        edge_valid = (node_mask.unsqueeze(1) * node_mask.unsqueeze(2))
         lp_E = lp_E * upper_mask.float() * edge_valid.float()
 
-        log_prob = lp_E.reshape(bs, -1).sum(dim=-1)  # (bs,)
-
-        return mols, log_prob
+        return lp_E.reshape(bs, -1).sum(dim=-1)
 
     def test_step(self, batch, i):
+        t0 = time.time()
         output, aux = self.encoder(batch)
         data = batch["graph"]
         data = self._apply_merge(data, output, aux)
@@ -611,9 +696,11 @@ class Spec2MolFlowMatching(pl.LightningModule):
         true_mols = [Chem.inchi.MolFromInchi(data.get_example(idx).inchi) for idx in range(len(data))]
         predicted_mols = [list() for _ in range(len(data))]
 
-        for _ in range(self.test_num_samples):
+        for s in range(self.test_num_samples):
             for idx, mol in enumerate(self.sample_batch(data)):
                 predicted_mols[idx].append(mol)
+            if self.global_rank == 0 and (s + 1) % 10 == 0:
+                logging.info(f"  test batch {i}: sample {s + 1}/{self.test_num_samples}")
 
         with open(f"preds/{self.name}_rank_{self.global_rank}_pred_{i}.pkl", "wb") as f:
             pickle.dump(predicted_mols, f)
@@ -624,6 +711,13 @@ class Spec2MolFlowMatching(pl.LightningModule):
             self.test_k_acc.update(predicted_mols[idx], true_mols[idx])
             self.test_sim_metrics.update(predicted_mols[idx], true_mols[idx])
             self.test_validity.update(predicted_mols[idx])
+
+        if self.global_rank == 0:
+            elapsed = time.time() - t0
+            acc_1 = self.test_k_acc.metrics['acc_at_1'].correct.item() / max(self.test_k_acc.metrics['acc_at_1'].total.item(), 1)
+            val = self.test_validity.valid.item() / max(self.test_validity.total.item(), 1)
+            logging.info(f"Test batch {i} done in {elapsed:.1f}s | "
+                         f"running acc@1={acc_1:.4f}, validity={val:.4f}")
 
         return {'loss': val_loss}
 
